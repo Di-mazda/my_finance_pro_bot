@@ -108,14 +108,29 @@
   async function loadPlan() {
     try {
       const res = await apiGet("/api/plan");
-      const data = await res.json().catch(() => ({}));
+      const rawText = await res.text();
+      let data = {};
+      try {
+        data = rawText ? JSON.parse(rawText) : {};
+      } catch (parseErr) {
+        // Ответ пришёл не в JSON - скорее всего это НЕ наш aiohttp-сервер,
+        // а промежуточный узел (например, страница ошибки от Railway),
+        // т.е. запрос вообще не дошёл до services/webapp_api.py.
+        console.error("plan.js: /api/plan вернул не-JSON тело:", rawText.slice(0, 500));
+      }
+
       if (!res.ok) {
-        showFatalError(data.message || "Не удалось загрузить план. Откройте бота и попробуйте снова.");
+        console.error("plan.js: /api/plan ->", res.status, data);
+        showFatalError(
+          data.message || `Сервер ответил ошибкой ${res.status}. Откройте бота и попробуйте снова.`
+        );
         return false;
       }
+
       state = data;
       return true;
     } catch (e) {
+      console.error("plan.js: сеть/фетч упал:", e);
       showFatalError("Нет связи с сервером. Проверьте интернет и попробуйте снова.");
       return false;
     }
