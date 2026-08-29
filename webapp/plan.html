@@ -16,7 +16,12 @@
 
     <header class="topbar">
       <h1>📅 План на год</h1>
-      <p class="subtitle" id="horizon-subtitle"></p>
+      <div class="nav-row">
+        <button id="prev-window-btn" class="nav-btn" type="button" title="На 12 месяцев назад">◀</button>
+        <button id="today-window-btn" class="nav-btn nav-btn-text" type="button" title="Вернуться к текущему месяцу">Сегодня</button>
+        <p class="subtitle" id="horizon-subtitle"></p>
+        <button id="next-window-btn" class="nav-btn" type="button" title="На 12 месяцев вперёд">▶</button>
+      </div>
     </header>
 
     <section class="summary-cards">
@@ -50,9 +55,27 @@
     <p class="hint">
       Нажмите на 🔒 в ячейке, чтобы запретить автопересчёт лимита для этой
       категории в этом месяце. Заполните первый месяц строки — остальные
-      месяцы заполнятся тем же значением автоматически.
+      месяцы заполнятся тем же значением автоматически. Если правка уводит
+      план накоплений в минус, число остаётся видно только у вас (не
+      сохраняется), пока вы не поправите план.
     </p>
 
+  </div>
+
+  <!-- НОВОЕ: собственное модальное окно вместо window.prompt()/window.confirm() -
+       нативные диалоги в некоторых встроенных webview (например, в Telegram
+       Desktop) иногда ведут себя нестабильно и после закрытия оставляют
+       страницу в состоянии, где обычные поля ввода перестают ловить фокус
+       до следующего переключения окон. -->
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div class="modal-box">
+      <p id="modal-message" class="modal-message"></p>
+      <input id="modal-input" class="modal-input hidden" type="text" autocomplete="off">
+      <div class="modal-actions">
+        <button id="modal-cancel-btn" class="modal-btn modal-btn-secondary" type="button">Отмена</button>
+        <button id="modal-confirm-btn" class="modal-btn modal-btn-primary" type="button">ОК</button>
+      </div>
+    </div>
   </div>
 </div>
 

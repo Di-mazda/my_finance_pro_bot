@@ -46,13 +46,25 @@ from logger_config import logger
 
 BOT_TOKEN = getenv("BOT_TOKEN", "")
 
-# Пользователь видит и заполняет план на PLAN_HORIZON_MONTHS месяцев вперёд,
-# начиная с текущего месяца - то же окно, что раньше строилось в
+# Пользователь по умолчанию видит план на PLAN_HORIZON_MONTHS месяцев
+# вперёд, начиная с текущего месяца - то же окно, что раньше строилось в
 # handlers/planning.py:_next_n_months. Окно "плавающее": при каждом
-# открытии Mini App отсчитывается заново от сегодняшнего дня, поэтому
-# план воспринимается как непрерывный "год вперёд", а не фиксированный
-# календарный год.
+# открытии Mini App без параметра start отсчитывается заново от
+# сегодняшнего дня. НОВОЕ: GET /api/plan?start=YYYY-MM-01 позволяет
+# пролистать таблицу на произвольный 12-месячный отрезок (см. кнопки
+# "◀"/"▶" в webapp/plan.js) - вперёд, чтобы заранее распланировать далёкое
+# будущее, или назад, чтобы посмотреть/поправить прошлые месяцы.
 PLAN_HORIZON_MONTHS = 12
+
+# Проверка "план накоплений не должен уходить в минус" всегда считается не
+# от начала текущего отображаемого окна, а от САМОГО РАННЕГО месяца, для
+# которого вообще есть данные (см. _true_start_month) - иначе при
+# пролистывании на будущее окно (например, месяцы 13-24) расчёт ошибочно
+# считал бы, что накоплений ноль в начале ЭТОГО окна, игнорируя всё, что
+# накопилось за предыдущий год. Чтобы не пересчитывать сразу на десятки лет
+# вперёд, ограничиваем непрерывный расчёт этим количеством месяцев от
+# истинного начала - с большим запасом (2 года) для типичного использования.
+VALIDATION_LOOKAHEAD_MONTHS = 24
 
 WEBAPP_DIR = Path(__file__).resolve().parent.parent / "webapp"
 
@@ -179,11 +191,40 @@ def _next_n_months(start: date, n: int) -> list:
     return months
 
 
-def _current_horizon() -> list:
-    return _next_n_months(date.today().replace(day=1), PLAN_HORIZON_MONTHS)
+def _month_diff(a: date, b: date) -> int:
+    """Сколько месяцев нужно прибавить к a (год-месяц), чтобы получить b."""
+    return (b.year - a.year) * 12 + (b.month - a.month)
 
 
-async def _project_cumulative_savings(
+def _parse_start_param(raw: str | None) -> date:
+    """Разбирает ?start=YYYY-MM-DD из GET /api/plan. Некорректное или
+    отсутствующее значение тихо откатывается к сегодняшнему месяцу - это
+    просто выбор ОКНА для просмотра, а не что-то, что стоит жёстко валить
+    ошибкой 400 ради лишнего клика мимо кнопки."""
+    if not raw:
+        return date.today().replace(day=1)
+    try:
+        return date.fromisoformat(raw).replace(day=1)
+    except ValueError:
+        return date.today().replace(day=1)
+
+
+async def _true_start_month(phone: str, at_least: date) -> date:
+    """
+    Самый ранний месяц, для которого вообще есть хоть какие-то данные
+    плана (ЗП или траты по категориям), либо at_least, если данных ещё
+    нет вообще. Нужен как точка отсчёта для "Плана накоплений" - иначе
+    расчёт для окна, пролистанного вперёд или назад от сегодняшнего дня,
+    не будет учитывать то, что накопилось (или потратилось) до начала
+    этого окна.
+    """
+    horizon = await database.get_plan_horizon(phone)
+    if horizon:
+        return min(horizon[0], at_least)
+    return at_least
+
+
+async def _cumulative_over_range(
     phone: str,
     months: list,
     salary_override: dict | None = None,
@@ -191,10 +232,13 @@ async def _project_cumulative_savings(
     initial_savings_override: int | None = None,
 ) -> dict:
     """
-    Считает "План накоплений" (нарастающий итог) по месяцам окна с учётом
-    одной гипотетической правки (salary_override и/или category_override),
-    ещё не сохранённой в БД - чтобы понять, ДО записи в базу, не уйдёт ли
-    в минус какой-то месяц. Возвращает {month_iso: накопления_на_конец_месяца}.
+    Считает "План накоплений" (нарастающий итог) по ПЕРЕДАННОМУ списку
+    месяцев подряд, начиная от initial_savings, с учётом одной
+    гипотетической правки (salary_override и/или category_override), ещё
+    не сохранённой в БД. months должен начинаться достаточно рано, чтобы
+    накопления на его первый месяц были действительно нулевыми
+    (initial_savings) - см. _true_start_month и обёртки ниже, которые сами
+    подбирают правильный months.
     """
     month_keys = [m.isoformat() for m in months]
 
@@ -237,6 +281,39 @@ async def _project_cumulative_savings(
     return cumulative
 
 
+async def _display_cumulative(phone: str, display_months: list, **overrides) -> dict:
+    """
+    "План накоплений" для ПОКАЗА в таблице (GET /api/plan) - считает
+    непрерывно от истинного начала данных до конца отображаемого окна
+    (чтобы пролистанное вперёд/назад окно показывало корректный
+    накопленный остаток), но возвращает значения только для месяцев,
+    которые реально видны в этом окне.
+    """
+    true_start = await _true_start_month(phone, display_months[0])
+    full_len = _month_diff(true_start, display_months[-1]) + 1
+    full_months = _next_n_months(true_start, full_len)
+
+    full_cumulative = await _cumulative_over_range(phone, full_months, **overrides)
+    display_keys = [m.isoformat() for m in display_months]
+    return {mk: full_cumulative[mk] for mk in display_keys}
+
+
+async def _validation_cumulative(phone: str, edited_month: date, **overrides) -> dict:
+    """
+    "План накоплений" для ПРОВЕРКИ перед сохранением ячейки - считает
+    непрерывно от истинного начала данных на VALIDATION_LOOKAHEAD_MONTHS
+    месяцев вперёд (с запасом, чтобы захватить и edited_month, даже если
+    он дальше в будущем, чем обычный запас). Возвращает ВСЕ месяцы этого
+    расчёта - в отличие от _display_cumulative, здесь важно проверить
+    минус в любом из них, а не только в узком окне, которое сейчас
+    открыто в интерфейсе.
+    """
+    true_start = await _true_start_month(phone, edited_month)
+    length = max(VALIDATION_LOOKAHEAD_MONTHS, _month_diff(true_start, edited_month) + 1)
+    full_months = _next_n_months(true_start, length)
+    return await _cumulative_over_range(phone, full_months, **overrides)
+
+
 def _negative_months(cumulative: dict) -> list:
     return [mk for mk, value in cumulative.items() if value < 0]
 
@@ -260,7 +337,8 @@ def _rejected_response(cumulative: dict) -> web.Response:
 
 async def get_plan(request: web.Request) -> web.Response:
     phone = request["phone"]
-    months = _current_horizon()
+    start_month = _parse_start_param(request.query.get("start"))
+    months = _next_n_months(start_month, PLAN_HORIZON_MONTHS)
     month_keys = [m.isoformat() for m in months]
 
     categories = await database.get_categories_full(phone)  # [{id, name, is_protected}]
@@ -279,7 +357,7 @@ async def get_plan(request: web.Request) -> web.Response:
             plan[cat_key][mk] = {"amount": amount, "no_recalc": bool(no_recalc)}
 
     initial_savings = await database.get_initial_savings(phone)
-    cumulative = await _project_cumulative_savings(phone, months)
+    cumulative = await _display_cumulative(phone, months)
 
     return web.json_response({
         "months": month_keys,
@@ -357,7 +435,7 @@ async def save_salary_cell(request: web.Request) -> web.Response:
     phone = request["phone"]
     try:
         body = await request.json()
-        month = date.fromisoformat(body["month"])
+        month = date.fromisoformat(body["month"]).replace(day=1)
         amount = int(body["amount"])
     except (KeyError, ValueError, TypeError, json.JSONDecodeError):
         return web.json_response({"error": "bad_request"}, status=400)
@@ -365,12 +443,15 @@ async def save_salary_cell(request: web.Request) -> web.Response:
     if amount < 0:
         return web.json_response({"error": "negative_amount"}, status=400)
 
-    months = _current_horizon()
-    if month not in months:
+    # НОВОЕ: раньше месяц обязательно должен был входить в "окно от
+    # сегодня" - это ломало правку прошлых месяцев и любого окна,
+    # пролистанного кнопками "◀"/"▶" (см. webapp/plan.js). Оставляем лишь
+    # грубую защиту от заведомо мусорных дат.
+    if abs(_month_diff(date.today().replace(day=1), month)) > 120:
         return web.json_response({"error": "month_out_of_range"}, status=400)
 
-    cumulative = await _project_cumulative_savings(
-        phone, months, salary_override={month.isoformat(): amount},
+    cumulative = await _validation_cumulative(
+        phone, month, salary_override={month.isoformat(): amount},
     )
     if _negative_months(cumulative):
         return _rejected_response(cumulative)
@@ -384,7 +465,7 @@ async def save_category_plan_cell(request: web.Request) -> web.Response:
     try:
         body = await request.json()
         category_id = int(body["category_id"])
-        month = date.fromisoformat(body["month"])
+        month = date.fromisoformat(body["month"]).replace(day=1)
         amount = int(body["amount"])
         no_recalc = bool(body.get("no_recalc", False))
     except (KeyError, ValueError, TypeError, json.JSONDecodeError):
@@ -397,12 +478,11 @@ async def save_category_plan_cell(request: web.Request) -> web.Response:
     if owner_phone != phone:
         return web.json_response({"error": "not_found"}, status=404)
 
-    months = _current_horizon()
-    if month not in months:
+    if abs(_month_diff(date.today().replace(day=1), month)) > 120:
         return web.json_response({"error": "month_out_of_range"}, status=400)
 
-    cumulative = await _project_cumulative_savings(
-        phone, months, category_override={(category_id, month.isoformat()): amount},
+    cumulative = await _validation_cumulative(
+        phone, month, category_override={(category_id, month.isoformat()): amount},
     )
     if _negative_months(cumulative):
         return _rejected_response(cumulative)
@@ -419,9 +499,9 @@ async def save_initial_savings(request: web.Request) -> web.Response:
     except (KeyError, ValueError, TypeError, json.JSONDecodeError):
         return web.json_response({"error": "bad_request"}, status=400)
 
-    months = _current_horizon()
-    cumulative = await _project_cumulative_savings(
-        phone, months, initial_savings_override=amount,
+    today_month = date.today().replace(day=1)
+    cumulative = await _validation_cumulative(
+        phone, today_month, initial_savings_override=amount,
     )
     if _negative_months(cumulative):
         return _rejected_response(cumulative)

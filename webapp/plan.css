@@ -12,7 +12,10 @@
   --positive-bg: rgba(31, 168, 85, 0.10);
   --negative: #e0483e;
   --negative-bg: rgba(224, 72, 62, 0.12);
-  --locked-bg: rgba(142, 142, 147, 0.14);
+  --locked-bg: rgba(142, 142, 147, 0.16);
+  --unsaved: #d99a00;
+  --unsaved-bg: rgba(217, 154, 0, 0.12);
+  --current-month-tint: rgba(36, 129, 204, 0.10);
 
   color-scheme: light dark;
 }
@@ -20,6 +23,7 @@
 * { box-sizing: border-box; }
 
 html, body {
+  height: 100%;
   margin: 0;
   padding: 0;
   background: var(--bg);
@@ -27,9 +31,15 @@ html, body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
   font-variant-numeric: tabular-nums;
   -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
 }
 
-#app { padding-bottom: 32px; }
+#app {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
 
 .hidden { display: none !important; }
 
@@ -40,17 +50,63 @@ html, body {
   height: 60vh;
   color: var(--hint);
   font-size: 15px;
+  padding: 0 24px;
+  text-align: center;
 }
 
-.topbar { padding: 14px 16px 4px; }
-.topbar h1 { font-size: 19px; margin: 0 0 2px; font-weight: 700; }
-.subtitle { margin: 0; color: var(--hint); font-size: 13px; }
+/* НОВОЕ: #content - флекс-колонка на всю высоту экрана, .table-scroll
+   занимает всё оставшееся место (flex:1) - именно это позволяет
+   position:sticky внутри неё работать как "замороженные" шапка/колонки
+   Excel-подобной таблицы, а не просто прокручиваться вместе со страницей. */
+#content {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar { padding: 12px 16px 4px; flex: none; }
+.topbar h1 { font-size: 19px; margin: 0 0 6px; font-weight: 700; }
+
+.nav-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.nav-row .subtitle {
+  flex: 1;
+  margin: 0;
+  color: var(--hint);
+  font-size: 13px;
+  text-align: center;
+}
+.nav-btn {
+  flex: none;
+  border: none;
+  background: var(--secondary-bg);
+  color: var(--text);
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.nav-btn:active { background: var(--border); }
+.nav-btn-text {
+  width: auto;
+  padding: 0 10px;
+  font-size: 12px;
+  color: var(--link);
+  font-weight: 600;
+}
 
 .summary-cards {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
   padding: 10px 16px;
+  flex: none;
 }
 .card {
   background: var(--secondary-bg);
@@ -75,6 +131,10 @@ html, body {
   padding: 0;
   outline: none;
 }
+#initial-savings-input.input-unsaved {
+  color: var(--unsaved);
+}
+
 .year-total {
   font-size: 17px;
   font-weight: 700;
@@ -90,12 +150,17 @@ html, body {
   color: var(--negative);
   font-size: 13px;
   line-height: 1.4;
+  flex: none;
 }
+.banner .banner-line + .banner-line { margin-top: 6px; }
+.banner.banner-warn-only { background: var(--unsaved-bg); color: var(--unsaved); }
 
 .table-scroll {
-  overflow-x: auto;
-  padding: 0 0 4px;
+  flex: 1 1 auto;
+  min-height: 220px;
+  overflow: auto;
   -webkit-overflow-scrolling: touch;
+  border-top: 1px solid var(--border);
 }
 
 table {
@@ -119,16 +184,45 @@ th.month-col, td.month-col {
   border-left: 1px solid var(--border);
 }
 
-th.name-col, td.name-col {
+/* Липкие колонки слева: категория / всего / среднее в месяц. Каждая
+   ОБЯЗАТЕЛЬНО с непрозрачным фоном var(--bg), иначе при горизонтальной
+   прокрутке сквозь них будут просвечивать цифры соседних ячеек (это и
+   была причина "заезжания" зарплаты на цифры - см. .salary-row ниже,
+   где тонировка теперь применяется ТОЛЬКО к .month-col). */
+th.name-col, td.name-col,
+th.total-col, td.total-col,
+th.avg-col, td.avg-col {
   position: sticky;
-  left: 0;
   z-index: 3;
   background: var(--bg);
-  width: 132px;
-  min-width: 132px;
-  max-width: 132px;
+}
+th.name-col, td.name-col {
+  left: 0;
+  width: 128px;
+  min-width: 128px;
+  max-width: 128px;
   text-align: left;
   padding: 8px 8px 8px 12px;
+}
+th.total-col, td.total-col {
+  left: 128px;
+  width: 82px;
+  min-width: 82px;
+  text-align: right;
+  padding: 8px 8px 8px 6px;
+  border-left: 1px solid var(--border);
+  color: var(--hint);
+  font-size: 12px;
+}
+th.avg-col, td.avg-col {
+  left: 210px;
+  width: 82px;
+  min-width: 82px;
+  text-align: right;
+  padding: 8px 10px 8px 6px;
+  border-right: 2px solid var(--border);
+  color: var(--hint);
+  font-size: 12px;
 }
 
 thead th {
@@ -143,10 +237,30 @@ thead th {
   text-align: center;
   border-bottom: 1px solid var(--border);
 }
-thead th.name-col { z-index: 5; text-align: left; }
+thead th.name-col, thead th.total-col, thead th.avg-col {
+  z-index: 5;
+  text-align: left;
+}
+thead th.total-col, thead th.avg-col { text-align: right; }
 
-/* Зарплата */
-tr.salary-row td { background: rgba(36, 129, 204, 0.08); font-weight: 600; }
+/* Подсветка текущего месяца (по московскому времени, см. plan.js) -
+   inset box-shadow ложится ПОВЕРХ обычного background, но ПОД текстом/
+   инпутом, поэтому не портит уже существующие цвета (например
+   .value-negative), а мягко тонирует всю колонку целиком. */
+.current-month {
+  box-shadow: inset 0 0 0 9999px var(--current-month-tint);
+}
+thead th.current-month {
+  box-shadow: inset 0 0 0 9999px var(--current-month-tint);
+  color: var(--link);
+}
+
+/* Зарплата - тонировка только у столбцов с цифрами (.month-col), НЕ у
+   липких name/total/avg ячеек этой строки - иначе их непрозрачный фон
+   заменяется полупрозрачным, и сквозь него при прокрутке видны цифры
+   соседних ячеек (это и было "заезжание" из п.9). */
+tr.salary-row td.month-col { background: rgba(36, 129, 204, 0.08); font-weight: 600; }
+tr.salary-row td.month-col.current-month { box-shadow: inset 0 0 0 9999px var(--current-month-tint); }
 tr.salary-row td.name-col { font-weight: 700; }
 
 /* Категории */
@@ -154,8 +268,8 @@ tr.category-row td.name-col { padding: 0; }
 .category-name-cell {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 8px 4px 8px 12px;
+  gap: 2px;
+  padding: 8px 4px 8px 10px;
 }
 .category-name-cell input.cat-name {
   flex: 1;
@@ -168,19 +282,34 @@ tr.category-row td.name-col { padding: 0; }
   padding: 2px 0;
   outline: none;
 }
+
+/* Иконки-переключатели (защита/очистка/удаление) - собственный "бейдж"
+   вместо надежды на CSS `color`, который цветные emoji игнорируют. */
 .icon-btn {
+  position: relative;
   border: none;
   background: transparent;
-  padding: 2px 3px;
-  font-size: 13px;
+  padding: 3px;
+  width: 22px;
+  height: 22px;
+  font-size: 12px;
   line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   color: var(--hint);
   cursor: pointer;
-  border-radius: 6px;
+  border-radius: 7px;
   flex: none;
+  opacity: 0.55;
 }
-.icon-btn.active { color: var(--button); }
+.icon-btn.active {
+  opacity: 1;
+  background: rgba(36, 129, 204, 0.16);
+  box-shadow: 0 0 0 1.5px var(--link) inset;
+}
 .icon-btn.danger:active { background: var(--negative-bg); }
+.icon-btn.clear-btn:active { background: var(--unsaved-bg); }
 
 .add-category-row td {
   padding: 8px 12px;
@@ -206,14 +335,14 @@ tr.category-row td.name-col { padding: 0; }
 .cell-wrap input.amount {
   width: 100%;
   min-width: 0;
-  border: 1px solid transparent;
+  border: 1.5px solid transparent;
   border-radius: 6px;
   background: transparent;
   color: var(--text);
   font-size: 13px;
   font-variant-numeric: tabular-nums;
   text-align: right;
-  padding: 4px 16px 4px 4px;
+  padding: 4px 17px 4px 4px;
   outline: none;
 }
 .cell-wrap input.amount:focus {
@@ -221,36 +350,66 @@ tr.category-row td.name-col { padding: 0; }
   background: var(--bg);
 }
 .cell-wrap.locked input.amount { background: var(--locked-bg); }
-.cell-wrap.pending input.amount { border-color: #d99a00; }
-.cell-wrap.rejected input.amount { border-color: var(--negative); color: var(--negative); }
+.cell-wrap.pending input.amount { opacity: 0.6; }
+.cell-wrap.unsaved input.amount {
+  border-color: var(--unsaved);
+  border-style: dashed;
+  color: var(--unsaved);
+  background: var(--unsaved-bg);
+}
 
+/* Замок "не пересчитывать" - НЕЗАМЕТНЫЙ, когда выключен (маленький,
+   полупрозрачный, обесцвеченный), и ЗАМЕТНЫЙ, когда включён (крупнее,
+   цветной кружок-подложка) - раньше отличалась только opacity 0.45 vs 1,
+   что было почти незаметно. */
 .lock-toggle {
   position: absolute;
-  right: 2px;
+  right: 1px;
   top: 50%;
-  transform: translateY(-50%);
+  transform: translateY(-50%) scale(0.85);
   border: none;
   background: transparent;
   font-size: 10px;
-  padding: 2px;
-  opacity: 0.45;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  opacity: 0.22;
+  filter: grayscale(1);
   cursor: pointer;
+  transition: opacity .12s ease, transform .12s ease, filter .12s ease, background .12s ease;
 }
-.lock-toggle.active { opacity: 1; }
+.lock-toggle.active {
+  opacity: 1;
+  filter: none;
+  transform: translateY(-50%) scale(1.05);
+  background: rgba(217, 154, 0, 0.22);
+  box-shadow: 0 0 0 1.5px var(--unsaved);
+}
 
 /* Итоговые строки снизу */
 tr.total-expense-row td { color: var(--hint); }
 tr.savings-row td { font-weight: 600; }
 tr.cumulative-row td { font-weight: 700; }
+tr.total-expense-row td.total-col,
+tr.total-expense-row td.avg-col,
+tr.savings-row td.total-col,
+tr.savings-row td.avg-col { font-weight: 600; }
+tr.cumulative-row td.total-col,
+tr.cumulative-row td.avg-col { color: var(--hint); font-weight: 400; }
 
 td.month-col.value-positive { color: var(--positive); }
 td.month-col.value-negative { color: var(--negative); background: var(--negative-bg); }
 
 .hint {
-  margin: 10px 16px 0;
+  margin: 10px 16px 14px;
   color: var(--hint);
   font-size: 12px;
   line-height: 1.5;
+  flex: none;
 }
 
 .toast {
@@ -266,8 +425,62 @@ td.month-col.value-negative { color: var(--negative); background: var(--negative
   opacity: 0;
   transition: opacity .2s ease;
   pointer-events: none;
-  z-index: 20;
+  z-index: 30;
   max-width: 86vw;
   text-align: center;
 }
 .toast.show { opacity: 0.96; }
+
+/* Модальное окно (замена window.prompt/confirm) */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  z-index: 40;
+}
+.modal-box {
+  width: 100%;
+  max-width: 420px;
+  background: var(--bg);
+  border-radius: 16px 16px 0 0;
+  padding: 18px 18px calc(18px + env(safe-area-inset-bottom, 0px));
+}
+@media (min-width: 480px) {
+  .modal-overlay { align-items: center; }
+  .modal-box { border-radius: 16px; }
+}
+.modal-message {
+  margin: 0 0 12px;
+  font-size: 15px;
+  line-height: 1.4;
+}
+.modal-input {
+  width: 100%;
+  font-size: 16px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1.5px solid var(--border);
+  background: var(--secondary-bg);
+  color: var(--text);
+  outline: none;
+  margin-bottom: 14px;
+}
+.modal-input:focus { border-color: var(--link); }
+.modal-actions {
+  display: flex;
+  gap: 10px;
+}
+.modal-btn {
+  flex: 1;
+  border: none;
+  border-radius: 10px;
+  padding: 11px 12px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.modal-btn-primary { background: var(--button); color: var(--button-text); }
+.modal-btn-secondary { background: var(--secondary-bg); color: var(--text); }
