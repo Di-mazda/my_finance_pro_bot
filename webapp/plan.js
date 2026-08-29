@@ -155,6 +155,15 @@
   // Загрузка плана (с поддержкой пролистывания окна - см. п.11)
   // -------------------------------------------------------------------
 
+  // НОВОЕ (п.2 обсуждения): сортируем категории по id - тот же порядок,
+  // что и ORDER BY id на сервере (database.get_categories_full). Делаем
+  // это ещё и на клиенте защитно, чтобы порядок был предсказуемым даже
+  // если он вдруг не отсортирован сервером (либо если это старая версия
+  // бэкенда) - категории всегда идут в порядке создания, без "перемешивания".
+  function sortCategories() {
+    state.categories.sort((a, b) => Number(a.id) - Number(b.id));
+  }
+
   async function loadPlan(startIso) {
     try {
       const url = startIso ? `/api/plan?start=${encodeURIComponent(startIso)}` : "/api/plan";
@@ -177,6 +186,7 @@
 
       state = data;
       state._unsaved = new Set();
+      sortCategories();
       return true;
     } catch (e) {
       console.error("plan.js: сеть/фетч упал:", e);
@@ -706,6 +716,77 @@
     renderSalaryRow();
   }
 
+  // НОВОЕ: точечное обновление подсказки "скопировать из соседней ячейки"
+  // (⇦) - раньше она пересчитывалась только при полном рендере строки
+  // (renderCategoryRows/renderSalaryRow), а это происходит лишь при
+  // добавлении/удалении/защите категории, НЕ при обычном вводе суммы.
+  // Поэтому подсказка появлялась с опозданием - только после операции,
+  // вызывающей полный рендер. Теперь вызывается сразу при любой правке
+  // ячейки - см. handleCategoryEdit/fillCategoryRow/handleSalaryEdit/
+  // fillSalaryRow ниже.
+  function refreshCategoryCopyHint(categoryId, index) {
+    if (index < 0 || index >= state.months.length) return;
+    const month = state.months[index];
+    const catPlan = state.plan[categoryId] || {};
+    const amount = (catPlan[month] || {}).amount || 0;
+    const leftAmount = index > 0 ? ((catPlan[state.months[index - 1]] || {}).amount || 0) : 0;
+    const shouldShow = !amount && leftAmount > 0;
+
+    const input = document.querySelector(
+      `input.amount[data-kind="category"][data-category-id="${categoryId}"][data-month="${month}"]`
+    );
+    if (!input) return;
+    const wrap = input.closest(".cell-wrap");
+    if (!wrap) return;
+
+    const existingBtn = wrap.querySelector(".copy-hint");
+    if (shouldShow && !existingBtn) {
+      wrap.classList.add("has-copy");
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "copy-hint";
+      copyBtn.title = `Скопировать ${formatNum(leftAmount)} ₽ из предыдущего месяца`;
+      copyBtn.textContent = "⇦";
+      copyBtn.addEventListener("click", () => copyFromLeftCategory(categoryId, month, index));
+      wrap.appendChild(copyBtn);
+    } else if (!shouldShow && existingBtn) {
+      wrap.classList.remove("has-copy");
+      existingBtn.remove();
+    } else if (shouldShow && existingBtn) {
+      existingBtn.title = `Скопировать ${formatNum(leftAmount)} ₽ из предыдущего месяца`;
+    }
+  }
+
+  function refreshSalaryCopyHint(index) {
+    if (index < 0 || index >= state.months.length) return;
+    const month = state.months[index];
+    const amount = Number(state.salary[month]) || 0;
+    const leftAmount = index > 0 ? Number(state.salary[state.months[index - 1]]) || 0 : 0;
+    const shouldShow = !amount && leftAmount > 0;
+
+    const input = document.querySelector(`input.amount[data-kind="salary"][data-month="${month}"]`);
+    if (!input) return;
+    const wrap = input.closest(".cell-wrap");
+    if (!wrap) return;
+
+    const existingBtn = wrap.querySelector(".copy-hint");
+    if (shouldShow && !existingBtn) {
+      wrap.classList.add("has-copy");
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "copy-hint";
+      copyBtn.title = `Скопировать ${formatNum(leftAmount)} ₽ из предыдущего месяца`;
+      copyBtn.textContent = "⇦";
+      copyBtn.addEventListener("click", () => copyFromLeftSalary(month, index));
+      wrap.appendChild(copyBtn);
+    } else if (!shouldShow && existingBtn) {
+      wrap.classList.remove("has-copy");
+      existingBtn.remove();
+    } else if (shouldShow && existingBtn) {
+      existingBtn.title = `Скопировать ${formatNum(leftAmount)} ₽ из предыдущего месяца`;
+    }
+  }
+
   async function handleSalaryEdit(input, month, amount, index) {
     const wrap = input.closest(".cell-wrap");
     const previous = state.salary[month] || 0;
@@ -719,6 +800,8 @@
     // Предпросмотр сразу, ещё до ответа сервера.
     state.salary[month] = amount;
     updateSalaryTotals();
+    refreshSalaryCopyHint(index);
+    refreshSalaryCopyHint(index + 1);
     renderSummaryRows();
 
     wrap.classList.add("pending");
@@ -750,9 +833,12 @@
 
     for (const mk of state.months) {
       if (mk === skipMonth) continue;
+      const idx = state.months.indexOf(mk);
 
       state.salary[mk] = amount;
       updateSalaryTotals();
+      refreshSalaryCopyHint(idx);
+      refreshSalaryCopyHint(idx + 1);
       const cellInput = document.querySelector(
         `input.amount[data-kind="salary"][data-month="${mk}"]`
       );
@@ -812,6 +898,8 @@
 
     catPlan[month] = { amount, no_recalc: cell.no_recalc };
     updateCategoryTotals(categoryId);
+    refreshCategoryCopyHint(categoryId, index);
+    refreshCategoryCopyHint(categoryId, index + 1);
     renderSummaryRows();
 
     wrap.classList.add("pending");
@@ -844,9 +932,12 @@
 
     for (const mk of state.months) {
       if (mk === skipMonth) continue;
+      const idx = state.months.indexOf(mk);
 
       catPlan[mk] = { amount, no_recalc: noRecalc };
       updateCategoryTotals(categoryId);
+      refreshCategoryCopyHint(categoryId, idx);
+      refreshCategoryCopyHint(categoryId, idx + 1);
       const cellInput = document.querySelector(
         `input.amount[data-kind="category"][data-category-id="${categoryId}"][data-month="${mk}"]`
       );
@@ -911,6 +1002,7 @@
       if (!existing) {
         state.categories.push({ id: data.id, name: data.name, is_protected: false });
       }
+      sortCategories();
       if (!state.plan[data.id]) {
         state.plan[data.id] = {};
         for (const mk of state.months) state.plan[data.id][mk] = { amount: 0, no_recalc: false };

@@ -606,12 +606,17 @@ async def get_categories_full(phone):
     функция вместо изменения get_categories() - чтобы не сломать
     существующий код (keyboards.py, handlers/limits.py, handlers/reports.py),
     который распаковывает результат get_categories() как (id, category).
-    Используется только в services/budget_forecast.py.
+    Используется в services/budget_forecast.py и services/webapp_api.py.
+
+    ИЗМЕНЕНО: добавлен ORDER BY id - без него Postgres не гарантирует
+    порядок строк между запросами, из-за чего категории в таблице плана
+    Mini App могли визуально "перемешиваться" при каждом открытии. Порядок
+    по id = порядок создания категорий - предсказуемый и стабильный.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, category, is_protected FROM categories WHERE phone = $1",
+            "SELECT id, category, is_protected FROM categories WHERE phone = $1 ORDER BY id",
             phone,
         )
         return [
