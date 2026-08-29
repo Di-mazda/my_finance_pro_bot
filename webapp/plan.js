@@ -1184,6 +1184,39 @@
     if (ok) render();
   }
 
+  // -------------------------------------------------------------------
+  // Закрываемая подсказка под таблицей (см. .hint-banner в plan.css) -
+  // раньше текст был статичным и всегда занимал место на экране, теперь
+  // его можно закрыть - решение запоминается в localStorage, чтобы
+  // подсказка не появлялась заново при следующем открытии Mini App.
+  // -------------------------------------------------------------------
+
+  const HINT_DISMISSED_KEY = "planHintDismissed_v1";
+
+  function bindHintBanner() {
+    const banner = document.getElementById("hint-banner");
+    const closeBtn = document.getElementById("hint-close-btn");
+    if (!banner || !closeBtn) return;
+
+    let dismissed = false;
+    try {
+      dismissed = localStorage.getItem(HINT_DISMISSED_KEY) === "1";
+    } catch (e) {
+      // localStorage может быть недоступен (приватный режим и т.п.) -
+      // не критично, просто подсказка будет показываться каждый раз.
+    }
+    if (dismissed) banner.classList.add("hidden");
+
+    closeBtn.addEventListener("click", () => {
+      banner.classList.add("hidden");
+      try {
+        localStorage.setItem(HINT_DISMISSED_KEY, "1");
+      } catch (e) {
+        // ignore - в худшем случае подсказка вернётся при следующем открытии
+      }
+    });
+  }
+
   function bindNavButtons() {
     document.getElementById("prev-window-btn").addEventListener("click", () => navigateWindow(-1));
     document.getElementById("next-window-btn").addEventListener("click", () => navigateWindow(1));
@@ -1326,6 +1359,7 @@
     bindInitialSavingsInput();
     bindNavButtons();
     bindModal();
+    bindHintBanner();
 
     const ok = await loadPlan();
     if (ok) {

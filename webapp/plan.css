@@ -467,13 +467,41 @@ tr.cumulative-row td.avg-col { color: var(--hint); font-weight: 400; }
 td.month-col.value-positive { color: var(--positive); }
 td.month-col.value-negative { color: var(--negative); background: var(--negative-bg); }
 
-.hint {
+/* НОВОЕ: подсказка теперь закрываемый баннер (см. #hint-close-btn в
+   plan.js) - раньше статичный текст всегда занимал место на экране,
+   теперь его можно закрыть один раз, и он больше не будет показываться
+   (состояние хранится в localStorage). */
+.hint-banner {
+  position: relative;
   margin: 10px 16px 14px;
+  padding: 10px 34px 10px 12px;
+  border-radius: 10px;
+  background: var(--secondary-bg);
   color: var(--hint);
   font-size: 12px;
   line-height: 1.5;
   flex: none;
 }
+.hint-banner .hint-text { margin: 0; }
+.hint-close-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  border: none;
+  background: transparent;
+  color: var(--hint);
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  font-size: 13px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.hint-close-btn:active { background: var(--border); opacity: 1; }
 
 .toast {
   position: fixed;
