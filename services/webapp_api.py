@@ -72,35 +72,41 @@ def validate_init_data(init_data: str, bot_token: str, max_age_seconds: int = IN
     Официальный алгоритм проверки initData Telegram Mini Apps:
     https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
 
-    Возвращает распарсенные данные ({"user": {...}, "auth_date": "...", ...})
-    либо None, если подпись неверна/данные протухли/бот не сконфигурирован.
+    Возвращает (data, reason):
+    - data = {"user": {...}, "auth_date": "...", ...}, reason = None - если всё ок;
+    - data = None, reason = короткая строка-причина - если проверка не прошла.
+    reason предназначен ТОЛЬКО для логов на сервере (см. auth_middleware) -
+    наружу в HTTP-ответ он не идёт, чтобы не подсказывать посторонним, на
+    каком шаге проверки подписи можно было бы попробовать обмануть сервер.
     """
-    if not bot_token or not init_data:
-        return None
+    if not bot_token:
+        return None, "BOT_TOKEN не задан в окружении процесса, где запущен services/webapp_api.py"
+    if not init_data:
+        return None, "заголовок X-Telegram-Init-Data пуст (запрос сделан не из Telegram Mini App)"
 
     try:
         pairs = dict(parse_qsl(init_data, keep_blank_values=True, strict_parsing=True))
     except ValueError:
-        return None
+        return None, "initData не парсится как query-строка"
 
     received_hash = pairs.pop("hash", None)
     if not received_hash:
-        return None
+        return None, "в initData отсутствует поле hash"
 
     data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
     secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
     computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(computed_hash, received_hash):
-        return None
+        return None, "подпись hash не совпала - BOT_TOKEN у бота и у webapp_api.py, похоже, разные"
 
     auth_date = pairs.get("auth_date")
     if auth_date is not None and max_age_seconds is not None:
         try:
             if time.time() - int(auth_date) > max_age_seconds:
-                return None
+                return None, "initData устарела (auth_date старше допустимого срока)"
         except ValueError:
-            return None
+            return None, "auth_date не число"
 
     user_raw = pairs.get("user")
     try:
@@ -108,7 +114,10 @@ def validate_init_data(init_data: str, bot_token: str, max_age_seconds: int = IN
     except json.JSONDecodeError:
         user = None
 
-    return {"user": user, "auth_date": auth_date, "raw": pairs}
+    if not user:
+        return None, "в initData нет поля user"
+
+    return {"user": user, "auth_date": auth_date, "raw": pairs}, None
 
 
 @web.middleware
@@ -118,21 +127,32 @@ async def auth_middleware(request: web.Request, handler):
         return await handler(request)
 
     init_data = request.headers.get("X-Telegram-Init-Data", "")
-    validated = validate_init_data(init_data, BOT_TOKEN)
+    validated, reason = validate_init_data(init_data, BOT_TOKEN)
 
-    if not validated or not validated.get("user"):
-        return web.json_response({"error": "unauthorized"}, status=401)
+    if not validated:
+        # НОВОЕ: логируем ПРИЧИНУ отказа на сервере (видно в логах Railway),
+        # и отдаём человекочитаемое message в ответе - раньше здесь была
+        # только {"error": "unauthorized"} без message, из-за чего Mini App
+        # показывал общую надпись "Не удалось загрузить план" без всякой
+        # зацепки, что пошло не так.
+        logger.warning(f"Mini App: отказано в доступе к {request.path} - {reason}")
+        return web.json_response(
+            {"error": "unauthorized", "message": f"Не авторизован: {reason}."},
+            status=401,
+        )
 
     tg_user_id = validated["user"].get("id")
     user_info = await database.get_user_info(tg_user_id)
     if not user_info:
+        logger.warning(f"Mini App: tg_user_id={tg_user_id} не найден в базе (не проходил /start)")
         return web.json_response(
-            {"error": "user_not_found", "message": "Пользователь не найден. Откройте бота и авторизуйтесь заново."},
+            {"error": "user_not_found", "message": "Пользователь не найден. Откройте бота, нажмите /start и попробуйте снова."},
             status=404,
         )
 
     phone, _name, is_phone_owner = user_info
     if not is_phone_owner:
+        logger.info(f"Mini App: tg_user_id={tg_user_id} (phone={phone}) не владелец номера, доступ к плану запрещён")
         return web.json_response(
             {"error": "forbidden", "message": "Редактировать план может только владелец номера."},
             status=403,
