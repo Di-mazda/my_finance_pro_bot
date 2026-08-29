@@ -39,6 +39,14 @@ html, body {
   min-height: 100dvh;
   display: flex;
   flex-direction: column;
+  /* НОВОЕ (п.2 обсуждения): в альбомной ориентации чёлка телефона может
+     оказаться как слева, так и справа экрана - в зависимости от того, в
+     какую сторону повернули телефон. Telegram сам обновляет эти
+     переменные в реальном времени при повороте (Bot API 8.0+), поэтому
+     достаточно один раз задать отступы через них - без ручного
+     определения ориентации в JS. */
+  padding-left: calc(var(--tg-safe-area-inset-left, 0px) + var(--tg-content-safe-area-inset-left, 0px));
+  padding-right: calc(var(--tg-safe-area-inset-right, 0px) + var(--tg-content-safe-area-inset-right, 0px));
 }
 
 .hidden { display: none !important; }
@@ -188,8 +196,8 @@ th, td {
 }
 
 th.month-col, td.month-col {
-  width: 74px;
-  min-width: 74px;
+  width: 80px;
+  min-width: 80px;
   text-align: center;
   border-left: 1px solid var(--border);
 }
@@ -215,8 +223,8 @@ th.name-col, td.name-col {
    задаётся в plan.js) и НЕ закреплены - обычные прокручиваемые колонки. */
 th.total-col, td.total-col,
 th.avg-col, td.avg-col {
-  width: 82px;
-  min-width: 82px;
+  width: 90px;
+  min-width: 90px;
   text-align: right;
   padding: 8px 10px 8px 6px;
   border-left: 1px solid var(--border);
@@ -353,7 +361,7 @@ tr.category-row td.name-col { padding: 0; }
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 6px 4px;
+  padding: 6px 3px;
 }
 .cell-wrap input.amount {
   width: 100%;
@@ -362,12 +370,18 @@ tr.category-row td.name-col { padding: 0; }
   border-radius: 6px;
   background: transparent;
   color: var(--text);
-  font-size: 13px;
+  font-size: 12.5px;
   font-variant-numeric: tabular-nums;
   text-align: right;
-  padding: 4px 17px 4px 4px;
+  padding: 4px 16px 4px 3px;
   outline: none;
 }
+/* ИЗМЕНЕНО (п.4 обсуждения): у ячеек БЕЗ замка (зарплата) не нужно
+   резервировать место под несуществующую иконку - раньше зарплата
+   получала тот же правый отступ 17px "про запас", из-за чего цифры
+   выглядели сдвинутыми в пустоту вместо того, чтобы использовать всю
+   ширину ячейки. */
+.cell-wrap.no-lock input.amount { padding-right: 4px; }
 .cell-wrap input.amount:focus {
   border-color: var(--link);
   background: var(--bg);
@@ -412,6 +426,32 @@ tr.category-row td.name-col { padding: 0; }
   background: rgba(217, 154, 0, 0.22);
   box-shadow: 0 0 0 1.5px var(--unsaved);
 }
+
+/* НОВОЕ (п.1 обсуждения): кнопка "скопировать значение из соседнего
+   (левого) месяца" - показывается ТОЛЬКО когда ячейка пустая, а у левого
+   соседа уже есть значение (типичный случай - открылся новый месяц).
+   Специально сделана заметнее, чем замок в выключенном состоянии - это
+   полезная подсказка, а не редко нужный переключатель. */
+.copy-hint {
+  position: absolute;
+  left: 1px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: none;
+  background: rgba(36, 129, 204, 0.14);
+  color: var(--link);
+  font-size: 10px;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  cursor: pointer;
+}
+.copy-hint:active { background: rgba(36, 129, 204, 0.3); }
+.cell-wrap.has-copy input.amount { padding-left: 17px; }
 
 /* Итоговые строки снизу */
 tr.total-expense-row td { color: var(--hint); }
@@ -507,3 +547,19 @@ td.month-col.value-negative { color: var(--negative); background: var(--negative
 }
 .modal-btn-primary { background: var(--button); color: var(--button-text); }
 .modal-btn-secondary { background: var(--secondary-bg); color: var(--text); }
+
+/* НОВОЕ (п.3 обсуждения): только альбомная ориентация ТЕЛЕФОНА - высота
+   экрана в этом случае маленькая (обычно < 500px), у планшетов/десктопа
+   в альбомной ориентации высота намного больше, так что их этот блок не
+   затронет и книжная ориентация телефона тоже остаётся как была. */
+@media (orientation: landscape) and (max-height: 500px) {
+  th.name-col, td.name-col {
+    width: 192px;   /* было 128px - примерно в 1.5 раза шире */
+    min-width: 192px;
+    max-width: 192px;
+  }
+  th.month-col, td.month-col {
+    width: 92px;    /* было 74px */
+    min-width: 92px;
+  }
+}

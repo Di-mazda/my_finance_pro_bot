@@ -330,8 +330,12 @@
       const td = document.createElement("td");
       td.className = "month-col" + (mk === currentMonthIso ? " current-month" : "");
 
+      const amount = Number(state.salary[mk]) || 0;
+      const leftAmount = idx > 0 ? Number(state.salary[state.months[idx - 1]]) || 0 : 0;
+      const showCopyHint = !amount && leftAmount > 0;
+
       const wrap = document.createElement("div");
-      wrap.className = "cell-wrap";
+      wrap.className = "cell-wrap no-lock" + (showCopyHint ? " has-copy" : "");
       if (state._unsaved.has(`salary:${mk}`)) wrap.classList.add("unsaved");
 
       const input = document.createElement("input");
@@ -339,13 +343,23 @@
       input.type = "text";
       input.inputMode = "numeric";
       input.autocomplete = "off";
-      input.value = formatNum(state.salary[mk] || 0);
+      input.value = formatNum(amount);
       input.dataset.kind = "salary";
       input.dataset.month = mk;
       input.dataset.index = String(idx);
       attachAmountHandlers(input);
-
       wrap.appendChild(input);
+
+      if (showCopyHint) {
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.className = "copy-hint";
+        copyBtn.title = `Скопировать ${formatNum(leftAmount)} ₽ из предыдущего месяца`;
+        copyBtn.textContent = "⇦";
+        copyBtn.addEventListener("click", () => copyFromLeftSalary(mk, idx));
+        wrap.appendChild(copyBtn);
+      }
+
       td.appendChild(wrap);
       tr.appendChild(td);
     });
@@ -424,12 +438,17 @@
 
       state.months.forEach((mk, idx) => {
         const cellData = catPlan[mk] || { amount: 0, no_recalc: false };
+        const leftAmount = idx > 0 ? ((catPlan[state.months[idx - 1]] || {}).amount || 0) : 0;
+        const showCopyHint = !cellData.amount && leftAmount > 0;
 
         const td = document.createElement("td");
         td.className = "month-col" + (mk === currentMonthIso ? " current-month" : "");
 
         const wrap = document.createElement("div");
-        wrap.className = "cell-wrap" + (cellData.no_recalc ? " locked" : "");
+        wrap.className =
+          "cell-wrap" +
+          (cellData.no_recalc ? " locked" : "") +
+          (showCopyHint ? " has-copy" : "");
         if (state._unsaved.has(`category:${cat.id}:${mk}`)) wrap.classList.add("unsaved");
 
         const input = document.createElement("input");
@@ -443,6 +462,17 @@
         input.dataset.month = mk;
         input.dataset.index = String(idx);
         attachAmountHandlers(input);
+        wrap.appendChild(input);
+
+        if (showCopyHint) {
+          const copyBtn = document.createElement("button");
+          copyBtn.type = "button";
+          copyBtn.className = "copy-hint";
+          copyBtn.title = `Скопировать ${formatNum(leftAmount)} ₽ из предыдущего месяца`;
+          copyBtn.textContent = "⇦";
+          copyBtn.addEventListener("click", () => copyFromLeftCategory(cat.id, mk, idx));
+          wrap.appendChild(copyBtn);
+        }
 
         const lockBtn = document.createElement("button");
         lockBtn.type = "button";
@@ -451,7 +481,6 @@
         lockBtn.textContent = "🔒";
         lockBtn.addEventListener("click", () => toggleNoRecalc(cat.id, mk));
 
-        wrap.appendChild(input);
         wrap.appendChild(lockBtn);
         td.appendChild(wrap);
         tr.appendChild(td);
@@ -653,6 +682,30 @@
     }
   }
 
+  // НОВОЕ (п.1 обсуждения): "скопировать из соседнего месяца" - копирует
+  // значение из ЛЕВОЙ (предыдущей) ячейки той же строки. Типичный случай -
+  // открылось новое окно на 12 месяцев вперёд, появился один новый пустой
+  // столбец с теми же тратами/ЗП, что и раньше - лень вводить заново.
+  // Переиспользует ту же функцию сохранения, что и обычный ручной ввод,
+  // поэтому подчиняется той же серверной проверке "план накоплений не в
+  // минус" и тому же поведению "заполнить остаток строки", если это
+  // первая видимая колонка.
+  async function copyFromLeftSalary(month, index) {
+    if (index <= 0) return;
+    const leftMonth = state.months[index - 1];
+    const leftAmount = Number(state.salary[leftMonth]) || 0;
+    if (!leftAmount) return;
+
+    const input = document.querySelector(
+      `input.amount[data-kind="salary"][data-month="${month}"]`
+    );
+    if (!input) return;
+
+    input.value = formatNum(leftAmount);
+    await handleSalaryEdit(input, month, leftAmount, index);
+    renderSalaryRow();
+  }
+
   async function handleSalaryEdit(input, month, amount, index) {
     const wrap = input.closest(".cell-wrap");
     const previous = state.salary[month] || 0;
@@ -726,6 +779,23 @@
     } else if (saved > 0) {
       showToast(`Зарплата заполнена на ${saved + 1} мес.`);
     }
+  }
+
+  async function copyFromLeftCategory(categoryId, month, index) {
+    if (index <= 0) return;
+    const catPlan = state.plan[categoryId] || {};
+    const leftMonth = state.months[index - 1];
+    const leftAmount = (catPlan[leftMonth] || {}).amount || 0;
+    if (!leftAmount) return;
+
+    const input = document.querySelector(
+      `input.amount[data-kind="category"][data-category-id="${categoryId}"][data-month="${month}"]`
+    );
+    if (!input) return;
+
+    input.value = formatNum(leftAmount);
+    await handleCategoryEdit(input, categoryId, month, leftAmount, index);
+    renderCategoryRows();
   }
 
   async function handleCategoryEdit(input, categoryId, month, amount, index) {
