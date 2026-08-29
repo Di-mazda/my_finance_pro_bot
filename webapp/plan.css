@@ -179,6 +179,13 @@ html, body {
   overflow: auto;
   -webkit-overflow-scrolling: touch;
   border-top: 1px solid var(--border);
+  /* НОВОЕ: запас снизу, чтобы последняя строка таблицы не упиралась в край
+     экрана при прокрутке до конца - padding-bottom у overflow-контейнера
+     учитывается в его scrollHeight, то есть реально добавляет место ПОСЛЕ
+     последней строки, а не просто визуальный отступ. Плюс запас под
+     жестовую навигацию/safe area снизу на телефоне (по аналогии с
+     .topbar, который так же учитывает --tg-safe-area-inset-* сверху). */
+  padding-bottom: calc(16px + var(--tg-content-safe-area-inset-bottom, 0px) + var(--tg-safe-area-inset-bottom, 0px));
 }
 
 table {
