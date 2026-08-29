@@ -1,0 +1,273 @@
+:root {
+  --bg: var(--tg-theme-bg-color, #ffffff);
+  --secondary-bg: var(--tg-theme-secondary-bg-color, #f2f2f7);
+  --text: var(--tg-theme-text-color, #1c1c1e);
+  --hint: var(--tg-theme-hint-color, #8e8e93);
+  --link: var(--tg-theme-link-color, #2481cc);
+  --button: var(--tg-theme-button-color, #2481cc);
+  --button-text: var(--tg-theme-button-text-color, #ffffff);
+  --border: rgba(120, 120, 128, 0.24);
+
+  --positive: #1fa855;
+  --positive-bg: rgba(31, 168, 85, 0.10);
+  --negative: #e0483e;
+  --negative-bg: rgba(224, 72, 62, 0.12);
+  --locked-bg: rgba(142, 142, 147, 0.14);
+
+  color-scheme: light dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+  font-variant-numeric: tabular-nums;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#app { padding-bottom: 32px; }
+
+.hidden { display: none !important; }
+
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 60vh;
+  color: var(--hint);
+  font-size: 15px;
+}
+
+.topbar { padding: 14px 16px 4px; }
+.topbar h1 { font-size: 19px; margin: 0 0 2px; font-weight: 700; }
+.subtitle { margin: 0; color: var(--hint); font-size: 13px; }
+
+.summary-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 10px 16px;
+}
+.card {
+  background: var(--secondary-bg);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+.card label {
+  display: block;
+  font-size: 11.5px;
+  color: var(--hint);
+  margin-bottom: 4px;
+}
+.card-input-row { display: flex; align-items: baseline; gap: 4px; }
+.card-input-row .unit { color: var(--hint); font-size: 14px; }
+#initial-savings-input {
+  width: 100%;
+  border: none;
+  background: transparent;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+  padding: 0;
+  outline: none;
+}
+.year-total {
+  font-size: 17px;
+  font-weight: 700;
+}
+.year-total.positive { color: var(--positive); }
+.year-total.negative { color: var(--negative); }
+
+.banner {
+  margin: 0 16px 8px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: var(--negative-bg);
+  color: var(--negative);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.table-scroll {
+  overflow-x: auto;
+  padding: 0 0 4px;
+  -webkit-overflow-scrolling: touch;
+}
+
+table {
+  border-collapse: separate;
+  border-spacing: 0;
+  width: max-content;
+  min-width: 100%;
+}
+
+th, td {
+  font-size: 13px;
+  padding: 0;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+
+th.month-col, td.month-col {
+  width: 74px;
+  min-width: 74px;
+  text-align: center;
+  border-left: 1px solid var(--border);
+}
+
+th.name-col, td.name-col {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  background: var(--bg);
+  width: 132px;
+  min-width: 132px;
+  max-width: 132px;
+  text-align: left;
+  padding: 8px 8px 8px 12px;
+}
+
+thead th {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  background: var(--bg);
+  color: var(--hint);
+  font-weight: 600;
+  font-size: 11.5px;
+  padding: 8px 4px;
+  text-align: center;
+  border-bottom: 1px solid var(--border);
+}
+thead th.name-col { z-index: 5; text-align: left; }
+
+/* Зарплата */
+tr.salary-row td { background: rgba(36, 129, 204, 0.08); font-weight: 600; }
+tr.salary-row td.name-col { font-weight: 700; }
+
+/* Категории */
+tr.category-row td.name-col { padding: 0; }
+.category-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 4px 8px 12px;
+}
+.category-name-cell input.cat-name {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 2px 0;
+  outline: none;
+}
+.icon-btn {
+  border: none;
+  background: transparent;
+  padding: 2px 3px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--hint);
+  cursor: pointer;
+  border-radius: 6px;
+  flex: none;
+}
+.icon-btn.active { color: var(--button); }
+.icon-btn.danger:active { background: var(--negative-bg); }
+
+.add-category-row td {
+  padding: 8px 12px;
+}
+.add-category-row button {
+  border: 1px dashed var(--border);
+  background: transparent;
+  color: var(--link);
+  font-size: 13px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+/* Ячейки план/лимит */
+.cell-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 4px;
+}
+.cell-wrap input.amount {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  padding: 4px 16px 4px 4px;
+  outline: none;
+}
+.cell-wrap input.amount:focus {
+  border-color: var(--link);
+  background: var(--bg);
+}
+.cell-wrap.locked input.amount { background: var(--locked-bg); }
+.cell-wrap.pending input.amount { border-color: #d99a00; }
+.cell-wrap.rejected input.amount { border-color: var(--negative); color: var(--negative); }
+
+.lock-toggle {
+  position: absolute;
+  right: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: none;
+  background: transparent;
+  font-size: 10px;
+  padding: 2px;
+  opacity: 0.45;
+  cursor: pointer;
+}
+.lock-toggle.active { opacity: 1; }
+
+/* Итоговые строки снизу */
+tr.total-expense-row td { color: var(--hint); }
+tr.savings-row td { font-weight: 600; }
+tr.cumulative-row td { font-weight: 700; }
+
+td.month-col.value-positive { color: var(--positive); }
+td.month-col.value-negative { color: var(--negative); background: var(--negative-bg); }
+
+.hint {
+  margin: 10px 16px 0;
+  color: var(--hint);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  background: var(--text);
+  color: var(--bg);
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  opacity: 0;
+  transition: opacity .2s ease;
+  pointer-events: none;
+  z-index: 20;
+  max-width: 86vw;
+  text-align: center;
+}
+.toast.show { opacity: 0.96; }

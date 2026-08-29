@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>План на год</title>
+<link rel="stylesheet" href="plan.css">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+
+<div id="app">
+  <div id="loading" class="loading">Загружаю план…</div>
+
+  <div id="content" class="content hidden">
+
+    <header class="topbar">
+      <h1>📅 План на год</h1>
+      <p class="subtitle" id="horizon-subtitle"></p>
+    </header>
+
+    <section class="summary-cards">
+      <div class="card">
+        <label for="initial-savings-input">Начальные накопления</label>
+        <div class="card-input-row">
+          <input id="initial-savings-input" type="text" inputmode="numeric" autocomplete="off">
+          <span class="unit">₽</span>
+        </div>
+      </div>
+      <div class="card">
+        <label>Итог накоплений за год</label>
+        <div id="year-total" class="year-total">—</div>
+      </div>
+    </section>
+
+    <div id="banner" class="banner hidden"></div>
+
+    <div class="table-scroll">
+      <table id="plan-table">
+        <thead>
+          <tr id="header-row"></tr>
+        </thead>
+        <tbody id="salary-body"></tbody>
+        <tbody id="category-body"></tbody>
+        <tbody id="add-category-body"></tbody>
+        <tbody id="summary-body"></tbody>
+      </table>
+    </div>
+
+    <p class="hint">
+      Нажмите на 🔒 в ячейке, чтобы запретить автопересчёт лимита для этой
+      категории в этом месяце. Заполните первый месяц строки — остальные
+      месяцы заполнятся тем же значением автоматически.
+    </p>
+
+  </div>
+</div>
+
+<script src="plan.js"></script>
+</body>
+</html>
