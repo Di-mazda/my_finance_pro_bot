@@ -65,7 +65,17 @@ html, body {
   flex-direction: column;
 }
 
-.topbar { padding: 12px 16px 4px; flex: none; }
+/* НОВОЕ (п.6 обсуждения): Telegram сам прокидывает отступы под "чёлку" и
+   собственные кнопки управления (закрыть/свернуть/меню) через CSS-
+   переменные --tg-safe-area-inset-top / --tg-content-safe-area-inset-top
+   (Bot API 8.0+, задаются автоматически telegram-web-app.js). Плюс
+   базовые 18px даже когда эти переменные равны 0 (например, на Desktop,
+   где нет чёлки, но заголовок приложения Telegram всё равно нужно не
+   загораживать). */
+.topbar {
+  padding: calc(18px + var(--tg-content-safe-area-inset-top, 0px) + var(--tg-safe-area-inset-top, 0px)) 16px 4px;
+  flex: none;
+}
 .topbar h1 { font-size: 19px; margin: 0 0 6px; font-weight: 700; }
 
 .nav-row {
@@ -184,43 +194,32 @@ th.month-col, td.month-col {
   border-left: 1px solid var(--border);
 }
 
-/* Липкие колонки слева: категория / всего / среднее в месяц. Каждая
-   ОБЯЗАТЕЛЬНО с непрозрачным фоном var(--bg), иначе при горизонтальной
-   прокрутке сквозь них будут просвечивать цифры соседних ячеек (это и
-   была причина "заезжания" зарплаты на цифры - см. .salary-row ниже,
-   где тонировка теперь применяется ТОЛЬКО к .month-col). */
-th.name-col, td.name-col,
-th.total-col, td.total-col,
-th.avg-col, td.avg-col {
+/* Липкая колонка слева - только "Категория". ОБЯЗАТЕЛЬНО с непрозрачным
+   фоном var(--bg), иначе при горизонтальной прокрутке сквозь неё будут
+   просвечивать цифры соседних ячеек (это и была причина "заезжания"
+   зарплаты на цифры - см. .salary-row ниже, где тонировка теперь
+   применяется ТОЛЬКО к .month-col). */
+th.name-col, td.name-col {
   position: sticky;
+  left: 0;
   z-index: 3;
   background: var(--bg);
-}
-th.name-col, td.name-col {
-  left: 0;
   width: 128px;
   min-width: 128px;
   max-width: 128px;
   text-align: left;
   padding: 8px 8px 8px 12px;
 }
-th.total-col, td.total-col {
-  left: 128px;
-  width: 82px;
-  min-width: 82px;
-  text-align: right;
-  padding: 8px 8px 8px 6px;
-  border-left: 1px solid var(--border);
-  color: var(--hint);
-  font-size: 12px;
-}
+
+/* ИЗМЕНЕНО (п.2): "Всего"/"Средн/мес" теперь идут ПОСЛЕ месяцев (порядок
+   задаётся в plan.js) и НЕ закреплены - обычные прокручиваемые колонки. */
+th.total-col, td.total-col,
 th.avg-col, td.avg-col {
-  left: 210px;
   width: 82px;
   min-width: 82px;
   text-align: right;
   padding: 8px 10px 8px 6px;
-  border-right: 2px solid var(--border);
+  border-left: 1px solid var(--border);
   color: var(--hint);
   font-size: 12px;
 }
@@ -237,7 +236,7 @@ thead th {
   text-align: center;
   border-bottom: 1px solid var(--border);
 }
-thead th.name-col, thead th.total-col, thead th.avg-col {
+thead th.name-col {
   z-index: 5;
   text-align: left;
 }
@@ -255,13 +254,37 @@ thead th.current-month {
   color: var(--link);
 }
 
+/* НОВОЕ (п.3): раз настоящая липкая шапка (position: sticky у thead) не
+   срабатывает на части клиентов, дублируем подписи столбцов ОБЫЧНОЙ
+   (не sticky) строкой прямо перед "Расходы всего" - видно и без прокрутки
+   назад наверх, если категорий много. */
+tr.repeated-header-row td {
+  background: var(--secondary-bg);
+  color: var(--hint);
+  font-weight: 600;
+  font-size: 11.5px;
+  text-align: center;
+  padding: 8px 4px;
+  border-top: 2px solid var(--border);
+}
+tr.repeated-header-row td.name-col {
+  background: var(--secondary-bg);
+  text-align: left;
+}
+tr.repeated-header-row td.total-col,
+tr.repeated-header-row td.avg-col {
+  text-align: right;
+  color: var(--hint);
+}
+
 /* Зарплата - тонировка только у столбцов с цифрами (.month-col), НЕ у
-   липких name/total/avg ячеек этой строки - иначе их непрозрачный фон
-   заменяется полупрозрачным, и сквозь него при прокрутке видны цифры
-   соседних ячеек (это и было "заезжание" из п.9). */
+   липкой ячейки названия строки - иначе её непрозрачный фон заменяется
+   полупрозрачным, и сквозь него при прокрутке видны цифры соседних
+   ячеек (это и было "заезжание" из п.9). */
 tr.salary-row td.month-col { background: rgba(36, 129, 204, 0.08); font-weight: 600; }
 tr.salary-row td.month-col.current-month { box-shadow: inset 0 0 0 9999px var(--current-month-tint); }
 tr.salary-row td.name-col { font-weight: 700; }
+tr.salary-row td.total-col, tr.salary-row td.avg-col { font-weight: 600; }
 
 /* Категории */
 tr.category-row td.name-col { padding: 0; }

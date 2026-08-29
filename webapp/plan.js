@@ -23,6 +23,35 @@
 
   const MONTHS_RU = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
 
+  // НОВОЕ (п.8 обсуждения, уточнено): полноэкранный режим запрашиваем
+  // ТОЛЬКО на мобильных платформах - на Desktop он неудобен (мешает
+  // переключаться между окнами), а на телефоне это единственный способ
+  // получить максимум площади под таблицу.
+  const MOBILE_PLATFORMS = new Set(["android", "android_x", "ios"]);
+
+  function requestMaxSize() {
+    if (!tg) return;
+    tg.expand();
+    if (MOBILE_PLATFORMS.has(tg.platform) && typeof tg.requestFullscreen === "function") {
+      try {
+        tg.requestFullscreen();
+      } catch (e) {
+        // Старые версии клиента могут не поддерживать метод - тихо игнорируем.
+      }
+    }
+  }
+
+  // НОВОЕ: по умолчанию Telegram интерпретирует вертикальный свайп внутри
+  // Mini App как жест "свернуть/закрыть" - при прокрутке таблицы пальцем
+  // сверху вниз это утаскивает всё окно приложения вместе с содержимым.
+  // disableVerticalSwipes() (Bot API 7.7+) отключает это специально для
+  // случаев вроде нашего, где внутри самого приложения есть свой скролл.
+  function disableAppSwipes() {
+    if (tg && typeof tg.disableVerticalSwipes === "function") {
+      tg.disableVerticalSwipes();
+    }
+  }
+
   let state = {
     months: [],
     categories: [],
@@ -196,6 +225,35 @@
     return total;
   }
 
+  // НОВОЕ: точечное обновление колонок "Всего"/"Средн/мес" БЕЗ полной
+  // перерисовки строки - вызывается сразу после любой правки ячейки, а не
+  // только когда происходит полный renderCategoryRows()/renderSalaryRow()
+  // (которые перерисовываются лишь при добавлении/удалении/защите
+  // категории) - раньше из-за этого колонки не пересчитывались при
+  // обычном вводе суммы.
+  function updateCategoryTotals(categoryId) {
+    const tr = document.querySelector(`tr.category-row[data-category-id="${categoryId}"]`);
+    if (!tr) return;
+    const total = sumOverMonths(categoryId);
+    const avg = state.months.length ? total / state.months.length : 0;
+    const totalTd = tr.querySelector("td.total-col");
+    const avgTd = tr.querySelector("td.avg-col");
+    if (totalTd) totalTd.textContent = formatNum(total);
+    if (avgTd) avgTd.textContent = formatNum(avg);
+  }
+
+  function updateSalaryTotals() {
+    const tr = document.querySelector("tr.salary-row");
+    if (!tr) return;
+    let total = 0;
+    for (const mk of state.months) total += Number(state.salary[mk]) || 0;
+    const avg = state.months.length ? total / state.months.length : 0;
+    const totalTd = tr.querySelector("td.total-col");
+    const avgTd = tr.querySelector("td.avg-col");
+    if (totalTd) totalTd.textContent = formatNum(total);
+    if (avgTd) avgTd.textContent = formatNum(avg);
+  }
+
   // -------------------------------------------------------------------
   // Рендер
   // -------------------------------------------------------------------
@@ -212,32 +270,47 @@
     renderSummaryRows();
   }
 
-  function renderHeader() {
-    const row = document.getElementById("header-row");
+  // НОВОЕ: общий конструктор ячеек шапки - используется и для настоящей
+  // (sticky) шапки в <thead>, и для повторной строки с подписями столбцов
+  // прямо над "Расходы всего" (см. п.3 - настоящее закрепление шапки не
+  // сработало на части клиентов, поэтому дублируем подписи внизу, где их
+  // и так видно при долгой прокрутке списка категорий).
+  function buildHeaderRowCells(row, asRepeat) {
     row.innerHTML = "";
+    const cellTag = asRepeat ? "td" : "th";
 
-    const thName = document.createElement("th");
-    thName.className = "name-col";
-    thName.textContent = "Категория";
-    row.appendChild(thName);
-
-    const thTotal = document.createElement("th");
-    thTotal.className = "total-col";
-    thTotal.textContent = "Всего";
-    row.appendChild(thTotal);
-
-    const thAvg = document.createElement("th");
-    thAvg.className = "avg-col";
-    thAvg.textContent = "Средн/мес";
-    row.appendChild(thAvg);
+    const nameCell = document.createElement(cellTag);
+    nameCell.className = "name-col" + (asRepeat ? " repeated-header-cell" : "");
+    nameCell.textContent = "Категория";
+    row.appendChild(nameCell);
 
     const currentMonthIso = getMoscowMonthIso();
     for (const mk of state.months) {
-      const th = document.createElement("th");
-      th.className = "month-col" + (mk === currentMonthIso ? " current-month" : "");
-      th.textContent = monthLabel(mk);
-      row.appendChild(th);
+      const cell = document.createElement(cellTag);
+      cell.className =
+        "month-col" +
+        (mk === currentMonthIso ? " current-month" : "") +
+        (asRepeat ? " repeated-header-cell" : "");
+      cell.textContent = monthLabel(mk);
+      row.appendChild(cell);
     }
+
+    // ИЗМЕНЕНО (п.2): "Всего"/"Средн/мес" теперь идут ПОСЛЕ месяцев, а не
+    // перед ними, и не закреплены (не sticky) - по просьбе пользователя.
+    const totalCell = document.createElement(cellTag);
+    totalCell.className = "total-col" + (asRepeat ? " repeated-header-cell" : "");
+    totalCell.textContent = "Всего";
+    row.appendChild(totalCell);
+
+    const avgCell = document.createElement(cellTag);
+    avgCell.className = "avg-col" + (asRepeat ? " repeated-header-cell" : "");
+    avgCell.textContent = "Средн/мес";
+    row.appendChild(avgCell);
+  }
+
+  function renderHeader() {
+    const row = document.getElementById("header-row");
+    buildHeaderRowCells(row, false);
   }
 
   function renderSalaryRow() {
@@ -251,20 +324,6 @@
     nameTd.className = "name-col";
     nameTd.textContent = "💰 Зарплата";
     tr.appendChild(nameTd);
-
-    let total = 0;
-    for (const mk of state.months) total += Number(state.salary[mk]) || 0;
-    const avg = state.months.length ? total / state.months.length : 0;
-
-    const totalTd = document.createElement("td");
-    totalTd.className = "total-col";
-    totalTd.textContent = formatNum(total);
-    tr.appendChild(totalTd);
-
-    const avgTd = document.createElement("td");
-    avgTd.className = "avg-col";
-    avgTd.textContent = formatNum(avg);
-    tr.appendChild(avgTd);
 
     const currentMonthIso = getMoscowMonthIso();
     state.months.forEach((mk, idx) => {
@@ -290,6 +349,20 @@
       td.appendChild(wrap);
       tr.appendChild(td);
     });
+
+    let total = 0;
+    for (const mk of state.months) total += Number(state.salary[mk]) || 0;
+    const avg = state.months.length ? total / state.months.length : 0;
+
+    const totalTd = document.createElement("td");
+    totalTd.className = "total-col";
+    totalTd.textContent = formatNum(total);
+    tr.appendChild(totalTd);
+
+    const avgTd = document.createElement("td");
+    avgTd.className = "avg-col";
+    avgTd.textContent = formatNum(avg);
+    tr.appendChild(avgTd);
 
     body.appendChild(tr);
   }
@@ -347,19 +420,6 @@
       nameTd.appendChild(nameWrap);
       tr.appendChild(nameTd);
 
-      const total = sumOverMonths(cat.id);
-      const avg = state.months.length ? total / state.months.length : 0;
-
-      const totalTd = document.createElement("td");
-      totalTd.className = "total-col";
-      totalTd.textContent = formatNum(total);
-      tr.appendChild(totalTd);
-
-      const avgTd = document.createElement("td");
-      avgTd.className = "avg-col";
-      avgTd.textContent = formatNum(avg);
-      tr.appendChild(avgTd);
-
       const catPlan = state.plan[cat.id] || {};
 
       state.months.forEach((mk, idx) => {
@@ -397,6 +457,19 @@
         tr.appendChild(td);
       });
 
+      const total = sumOverMonths(cat.id);
+      const avg = state.months.length ? total / state.months.length : 0;
+
+      const totalTd = document.createElement("td");
+      totalTd.className = "total-col";
+      totalTd.textContent = formatNum(total);
+      tr.appendChild(totalTd);
+
+      const avgTd = document.createElement("td");
+      avgTd.className = "avg-col";
+      avgTd.textContent = formatNum(avg);
+      tr.appendChild(avgTd);
+
       body.appendChild(tr);
     }
   }
@@ -425,6 +498,15 @@
     const body = document.getElementById("summary-body");
     body.innerHTML = "";
 
+    // НОВОЕ (п.3): раз настоящая липкая шапка не сработала на части
+    // клиентов, дублируем подписи столбцов прямо здесь, перед "Расходы
+    // всего" - при долгой прокрутке списка категорий вниз видно, что
+    // означает каждый столбец, не листая обратно наверх.
+    const repeatRow = document.createElement("tr");
+    repeatRow.className = "repeated-header-row";
+    buildHeaderRowCells(repeatRow, true);
+    body.appendChild(repeatRow);
+
     const { totalExpense, savings, cumulative } = computeDerived();
     state.cumulative = cumulative;
 
@@ -445,6 +527,16 @@
     nameTd.textContent = label;
     tr.appendChild(nameTd);
 
+    const currentMonthIso = getMoscowMonthIso();
+    for (const mk of state.months) {
+      const td = document.createElement("td");
+      td.className = "month-col" + (mk === currentMonthIso ? " current-month" : "");
+      const v = valuesByMonth[mk] || 0;
+      td.textContent = formatNum(v);
+      if (colorize) td.classList.add(v < 0 ? "value-negative" : "value-positive");
+      tr.appendChild(td);
+    }
+
     const totalTd = document.createElement("td");
     totalTd.className = "total-col";
     const avgTd = document.createElement("td");
@@ -462,16 +554,6 @@
     }
     tr.appendChild(totalTd);
     tr.appendChild(avgTd);
-
-    const currentMonthIso = getMoscowMonthIso();
-    for (const mk of state.months) {
-      const td = document.createElement("td");
-      td.className = "month-col" + (mk === currentMonthIso ? " current-month" : "");
-      const v = valuesByMonth[mk] || 0;
-      td.textContent = formatNum(v);
-      if (colorize) td.classList.add(v < 0 ? "value-negative" : "value-positive");
-      tr.appendChild(td);
-    }
 
     return tr;
   }
@@ -529,6 +611,12 @@
   // успешном повторном сохранении, либо при следующей загрузке плана.
   // -------------------------------------------------------------------
 
+  function hideMobileKeyboard() {
+    if (tg && typeof tg.hideKeyboard === "function") {
+      tg.hideKeyboard();
+    }
+  }
+
   function attachAmountHandlers(input) {
     input.addEventListener("focus", () => {
       const raw = parseNum(input.value);
@@ -536,9 +624,15 @@
       input.select();
     });
     input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") input.blur();
+      if (e.key === "Enter") {
+        input.blur();
+        hideMobileKeyboard();
+      }
     });
-    input.addEventListener("blur", () => onAmountBlur(input));
+    input.addEventListener("blur", () => {
+      onAmountBlur(input);
+      hideMobileKeyboard();
+    });
   }
 
   async function onAmountBlur(input) {
@@ -571,6 +665,7 @@
 
     // Предпросмотр сразу, ещё до ответа сервера.
     state.salary[month] = amount;
+    updateSalaryTotals();
     renderSummaryRows();
 
     wrap.classList.add("pending");
@@ -604,6 +699,7 @@
       if (mk === skipMonth) continue;
 
       state.salary[mk] = amount;
+      updateSalaryTotals();
       const cellInput = document.querySelector(
         `input.amount[data-kind="salary"][data-month="${mk}"]`
       );
@@ -645,6 +741,7 @@
       isFirstColumn && state.months.slice(1).every((mk) => !((catPlan[mk] || {}).amount));
 
     catPlan[month] = { amount, no_recalc: cell.no_recalc };
+    updateCategoryTotals(categoryId);
     renderSummaryRows();
 
     wrap.classList.add("pending");
@@ -679,6 +776,7 @@
       if (mk === skipMonth) continue;
 
       catPlan[mk] = { amount, no_recalc: noRecalc };
+      updateCategoryTotals(categoryId);
       const cellInput = document.querySelector(
         `input.amount[data-kind="category"][data-category-id="${categoryId}"][data-month="${mk}"]`
       );
@@ -881,9 +979,13 @@
       input.select();
     });
     input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") input.blur();
+      if (e.key === "Enter") {
+        input.blur();
+        hideMobileKeyboard();
+      }
     });
     input.addEventListener("blur", async () => {
+      hideMobileKeyboard();
       const amount = parseNum(input.value);
       input.value = formatNum(amount);
       if (amount === (Number(state.initial_savings) || 0)) return;
@@ -1038,23 +1140,6 @@
     }
   }
 
-  // НОВОЕ (п.8): просим максимально доступную площадь под Mini App - на
-  // телефоне expand() обычно и так растягивает на весь экран, а вот на
-  // Desktop без requestFullscreen() (Bot API 8.0+) окно нередко остаётся
-  // маленьким. Полностью управлять размером ОС-окна Telegram Desktop
-  // снаружи нельзя - это максимум, что можно запросить через API.
-  function requestMaxSize() {
-    if (!tg) return;
-    tg.expand();
-    if (typeof tg.requestFullscreen === "function") {
-      try {
-        tg.requestFullscreen();
-      } catch (e) {
-        // Старые версии клиента могут не поддерживать метод - тихо игнорируем.
-      }
-    }
-  }
-
   // -------------------------------------------------------------------
   // Инициализация
   // -------------------------------------------------------------------
@@ -1063,6 +1148,7 @@
     if (tg) {
       tg.ready();
       requestMaxSize();
+      disableAppSwipes();
       applyThemeVars();
       if (tg.onEvent) tg.onEvent("themeChanged", applyThemeVars);
     }
