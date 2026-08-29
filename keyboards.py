@@ -10,26 +10,53 @@ from aiogram.types import (
 from database import get_user_info
 
 
-def _plan_webapp_button():
+def _normalize_webapp_url(raw: str) -> str:
     """
-    НОВОЕ: кнопка "📅 План на год" теперь открывает Telegram Mini App
-    (webapp/plan.html) вместо чатового сценария handlers/planning.py -
-    там же теперь заводятся и категории, и лимиты (план по месяцам), так
-    что отдельная кнопка "Лимиты и категории" больше не нужна и убрана из
-    клавиатуры ниже.
+    Telegram принимает в WebAppInfo только https-ссылки - если в .env
+    WEBAPP_URL указан без схемы (например, просто "xxx.up.railway.app",
+    как отдаёт Railway в поле домена) или по ошибке с "http://", Telegram
+    отвечает "Bad Request: ... Only HTTPS links are allowed" прямо при
+    попытке отправить клавиатуру. Поэтому всегда приводим к https:// сами,
+    вместо того чтобы полагаться на то, что переменная окружения задана
+    правильно.
+    """
+    raw = raw.strip().rstrip("/")
+    if not raw:
+        return ""
+    if raw.startswith("http://"):
+        raw = raw[len("http://"):]
+    elif raw.startswith("https://"):
+        raw = raw[len("https://"):]
+    return f"https://{raw}"
 
-    WEBAPP_URL - публичный https-адрес, на котором крутится сервер бота
-    (services/webapp_api.py отдаёт статику Mini App по пути /webapp/...).
-    Если переменная не задана (например, при локальном запуске без
-    домена), оставляем обычную текстовую кнопку - нажатие на неё попадёт
-    в handlers/fallback.py с понятной подсказкой, бот не упадёт.
+
+def get_plan_inline_keyboard():
     """
-    webapp_url = getenv("WEBAPP_URL", "").strip().rstrip("/")
+    ВАЖНО: по документации Telegram initData (данные о личности
+    пользователя, которые проверяет services/webapp_api.py) ВСЕГДА пустая,
+    если Mini App открыт через web_app-кнопку на ОБЫЧНОЙ (Reply)
+    клавиатуре - для такой кнопки Telegram выделяет только односторонний
+    канал Telegram.WebApp.sendData(), initData не передаётся вообще (см.
+    https://core.telegram.org/bots/webapps#keyboard-button-mini-apps).
+    initData появляется, только если Mini App открыт через INLINE-кнопку
+    сообщения или через кнопку меню (Menu Button) - Telegram описывает оба
+    варианта как идентичные по поведению.
+
+    Поэтому кнопка "📅 План на год" в основной (Reply) клавиатуре ниже -
+    обычная текстовая кнопка, а по нажатию handlers/planning.py:open_plan_webapp
+    присылает ОТДЕЛЬНОЕ сообщение с этой inline-кнопкой - только через неё
+    сервер сможет проверить личность пользователя.
+    """
+    webapp_url = _normalize_webapp_url(getenv("WEBAPP_URL", ""))
     if not webapp_url:
-        return KeyboardButton(text="📅 План на год")
-    return KeyboardButton(
-        text="📅 План на год",
-        web_app=WebAppInfo(url=f"{webapp_url}/webapp/plan.html"),
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="📊 Открыть таблицу плана",
+                web_app=WebAppInfo(url=f"{webapp_url}/webapp/plan.html"),
+            )]
+        ]
     )
 
 
@@ -39,11 +66,11 @@ def get_main_reply_keyboard(is_authorized=True):
         keyboard = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="Отчёт за текущий месяц"), KeyboardButton(text="Отчёт за прошлый месяц")],
-                # ИЗМЕНЕНО: кнопка "Лимиты и категории" убрана - управление
-                # категориями и лимитами (планом по месяцам) теперь целиком
-                # происходит в Mini App по кнопке "📅 План на год" (см.
-                # _plan_webapp_button() выше и webapp/plan.html).
-                [KeyboardButton(text="Текущие лимиты"), _plan_webapp_button()],
+                # ИЗМЕНЕНО: обычная текстовая кнопка (не web_app) - см.
+                # get_plan_inline_keyboard() выше и
+                # handlers/planning.py:open_plan_webapp, почему Mini App
+                # запускается через отдельную inline-кнопку, а не отсюда.
+                [KeyboardButton(text="Текущие лимиты"), KeyboardButton(text="📅 План на год")],
                 [KeyboardButton(text="Мой аккаунт")]
             ],
             resize_keyboard=True

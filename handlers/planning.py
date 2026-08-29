@@ -6,14 +6,30 @@ handlers/planning.py
 плана трат по категориям на 12 месяцев вперёд (кнопка "📅 План на год" ->
 "1️⃣ Сначала укажите ЗП" -> "2️⃣ Затем траты по каждой категории" и т.д.).
 
-Теперь кнопка "📅 План на год" (см. keyboards.py) открывает Telegram
-Mini App - таблицу (категории x месяцы) с зарплатой, лимитами, флагом
-"не пересчитывать" на ячейку, начальными накоплениями и планом накоплений
-нарастающим итогом. Вся эта логика и хранение переехали в
-services/webapp_api.py (HTTP API) и webapp/plan.html (сама таблица) -
-никакого FSM-сценария в чате для этого больше не требуется, поэтому
-planning_menu/process_salary_bulk/_start_category_plan_flow и т.д. отсюда
-убраны целиком.
+Теперь кнопка "📅 План на год" в основной клавиатуре (см. keyboards.py) -
+обычная текстовая кнопка. По нажатию хендлер open_plan_webapp ниже
+присылает ОТДЕЛЬНОЕ сообщение с INLINE-кнопкой, которая уже открывает
+Telegram Mini App - таблицу (категории x месяцы) с зарплатой, лимитами,
+флагом "не пересчитывать" на ячейку, начальными накоплениями и планом
+накоплений нарастающим итогом.
+
+ВАЖНО, почему именно так, в два шага, а не одной web_app-кнопкой сразу на
+основной клавиатуре (как было в первой версии): по официальной документации
+Telegram (https://core.telegram.org/bots/webapps#keyboard-button-mini-apps),
+initData (данные о личности пользователя, которые проверяет
+services/webapp_api.py) ВСЕГДА пустая, если Mini App открыт через web_app-
+кнопку на обычной Reply-клавиатуре - для такой кнопки Telegram выделяет
+только односторонний канал Telegram.WebApp.sendData(), без initData вообще.
+initData появляется только при открытии через INLINE-кнопку сообщения или
+через Menu Button - оба варианта Telegram прямо называет идентичными по
+поведению. Поэтому весь HTTP API с проверкой владельца номера
+(services/webapp_api.py) работает только если открывать таблицу именно
+через inline-кнопку из get_plan_inline_keyboard().
+
+Вся логика самой таблицы и её хранение - в services/webapp_api.py (HTTP
+API) и webapp/plan.html - никакого FSM-сценария в чате для неё не
+требуется, поэтому planning_menu/process_salary_bulk/_start_category_plan_flow
+и т.д. отсюда убраны целиком.
 
 Оставлены только точечные команды /зп и /план - быстрая правка ОДНОГО
 месяца без открытия Mini App, для тех, кто уже привык к ним. Они пишут в
@@ -23,12 +39,12 @@ planning_menu/process_salary_bulk/_start_category_plan_flow и т.д. отсюд
 
 from datetime import date
 
-from aiogram import Router
+from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
 
-from keyboards import get_main_reply_keyboard
+from keyboards import get_main_reply_keyboard, get_plan_inline_keyboard
 from database import get_user_info, get_categories, set_salary_plan, set_category_plan
 
 router = Router()
@@ -61,6 +77,32 @@ async def _require_owner(message: Message):
         return None
 
     return user_phone
+
+
+@router.message(F.text.lower() == "📅 план на год")
+async def open_plan_webapp(message: Message):
+    """
+    См. комментарий в шапке файла: сама кнопка в reply-клавиатуре - обычная
+    текстовая, а Mini App открывается через ОТДЕЛЬНУЮ inline-кнопку в новом
+    сообщении - иначе Telegram не передаст initData и
+    services/webapp_api.py не сможет определить, кто открыл таблицу.
+    """
+    user_phone = await _require_owner(message)
+    if user_phone is None:
+        return
+
+    keyboard = get_plan_inline_keyboard()
+    if keyboard is None:
+        await message.answer(
+            "⚠️ Таблица плана пока не настроена на сервере (не задан "
+            "WEBAPP_URL). Обратитесь к администратору бота."
+        )
+        return
+
+    await message.answer(
+        "📅 Нажмите кнопку ниже, чтобы открыть таблицу плана на год:",
+        reply_markup=keyboard,
+    )
 
 
 # ---------------------------------------------------------------------
