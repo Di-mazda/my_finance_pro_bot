@@ -6,8 +6,10 @@
 (browser/context/page) и простые типы, возвращает данные или бросает
 исключения. Ответы пользователю формирует вызывающий код в handlers/.
 """
+import asyncio
 import json
 import os
+import platform
 import time
 from calendar import monthrange
 from datetime import date, datetime
@@ -28,6 +30,77 @@ def _get_default_headless() -> bool:
     return os.getenv("BROWSER_HEADLESS", "true").strip().lower() != "false"
 
 
+# ============================================================================
+# НОВОЕ (03.09.2026): ограничение памяти на Railway (лимит 1 ГБ на процесс).
+# ============================================================================
+# 1) СЕМАФОР НА ОДНОВРЕМЕННЫЕ БРАУЗЕРЫ.
+#    Каждый Chromium (особенно в headful-режиме, см. блок про Xvfb ниже) -
+#    это 150-500 МБ памяти. Если два пользователя одновременно запросят
+#    отчёт/логин, раньше могли подняться два процесса Chrome разом - на
+#    1 ГБ памяти это реальный риск OOM. MAX_CONCURRENT_BROWSERS (по
+#    умолчанию 1) гарантирует, что новый браузер не запустится, пока не
+#    закроется предыдущий - следующий вызов launch_browser просто подождёт
+#    своей очереди вместо того, чтобы запуститься параллельно.
+#    Если понадобится больше параллелизма (например, после апгрейда тарифа
+#    Railway) - поднимите переменную окружения MAX_CONCURRENT_BROWSERS.
+_MAX_CONCURRENT_BROWSERS = max(1, int(os.getenv("MAX_CONCURRENT_BROWSERS", "1")))
+_browser_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_BROWSERS)
+
+# 2) ЛЕНИВЫЙ Xvfb (виртуальный дисплей).
+#    Раньше Xvfb поднимался один раз при старте бота (main.py:
+#    _maybe_start_virtual_display) и жил ВСЮ жизнь процесса, даже если
+#    браузер месяцами не открывался - это лишние ~20-50 МБ впустую.
+#    Теперь дисплей поднимается лениво прямо здесь, непосредственно перед
+#    первым headful-браузером, и гасится, когда закрывается ПОСЛЕДНИЙ
+#    активный headful-браузер (считаем ссылки в _virtual_display_refcount).
+#    Реальную экономию памяти это даёт небольшую (Xvfb сам по себе лёгкий,
+#    ~20-50 МБ), но она не требует усилий и не мешает - см. также вопрос
+#    про Xvfb в разборе утечки памяти в чате от 03.09.2026.
+_virtual_display = None
+_virtual_display_refcount = 0
+_virtual_display_lock = asyncio.Lock()
+
+
+async def _acquire_virtual_display() -> None:
+    global _virtual_display, _virtual_display_refcount
+    async with _virtual_display_lock:
+        _virtual_display_refcount += 1
+        if _virtual_display is not None:
+            return  # уже поднят другим (параллельным) браузером
+
+        if os.getenv("USE_VIRTUAL_DISPLAY", "false").strip().lower() != "true":
+            return
+        if platform.system() != "Linux":
+            return
+        try:
+            from pyvirtualdisplay import Display
+        except ImportError:
+            logger.warning(
+                "USE_VIRTUAL_DISPLAY=true, но пакет pyvirtualdisplay не установлен."
+            )
+            return
+        try:
+            _virtual_display = Display(visible=False, size=(1920, 1080))
+            _virtual_display.start()
+            logger.info("tbank_client: виртуальный дисплей Xvfb поднят лениво под headful-браузер.")
+        except Exception as e:
+            logger.exception(f"tbank_client: не удалось запустить Xvfb: {e}")
+            _virtual_display = None
+
+
+async def _release_virtual_display() -> None:
+    global _virtual_display, _virtual_display_refcount
+    async with _virtual_display_lock:
+        _virtual_display_refcount = max(0, _virtual_display_refcount - 1)
+        if _virtual_display_refcount == 0 and _virtual_display is not None:
+            try:
+                _virtual_display.stop()
+                logger.info("tbank_client: виртуальный дисплей Xvfb остановлен - активных браузеров больше нет.")
+            except Exception as e:
+                logger.warning(f"tbank_client: ошибка при остановке Xvfb: {e}")
+            _virtual_display = None
+
+
 async def launch_browser(playwright_instance, headless: bool | None = None):
     # ИЗМЕНЕНО: headless теперь необязателен - если явно не передан, берём
     # значение из переменной окружения BROWSER_HEADLESS (см. DEFAULT_HEADLESS
@@ -35,9 +108,52 @@ async def launch_browser(playwright_instance, headless: bool | None = None):
     # каждое место вызова launch_browser (их несколько: handlers/reports.py,
     # handlers/account.py).
     # Было: async def launch_browser(playwright_instance, headless: bool = True):
+    #
+    # ИЗМЕНЕНО (03.09.2026): добавлены семафор на число одновременных
+    # браузеров и ленивый подъём Xvfb - см. комментарий выше. Снаружи
+    # ничего менять не нужно: вызывающий код по-прежнему просто получает
+    # объект browser и вызывает browser.close() как раньше - семафор и
+    # Xvfb освобождаются автоматически внутри обёрнутого close().
+    # Было:
+    #     if headless is None:
+    #         headless = _get_default_headless()
+    #     return await playwright_instance.chromium.launch(headless=headless)
     if headless is None:
         headless = _get_default_headless()
-    return await playwright_instance.chromium.launch(headless=headless)
+
+    await _browser_semaphore.acquire()
+    if not headless:
+        await _acquire_virtual_display()
+
+    try:
+        browser = await playwright_instance.chromium.launch(headless=headless)
+    except Exception:
+        # Запуск не удался - сразу отдаём обратно то, что успели занять.
+        if not headless:
+            await _release_virtual_display()
+        _browser_semaphore.release()
+        raise
+
+    released = False
+    original_close = browser.close
+
+    async def _close_and_release(*args, **kwargs):
+        nonlocal released
+        try:
+            return await original_close(*args, **kwargs)
+        finally:
+            # Защита от повторного освобождения при повторном close() -
+            # в коде хендлеров browser.close() иногда вызывается больше
+            # одного раза на разных путях выхода (например, сторожем из
+            # services/browser_watchdog.py и обычным кодом одновременно).
+            if not released:
+                released = True
+                if not headless:
+                    await _release_virtual_display()
+                _browser_semaphore.release()
+
+    browser.close = _close_and_release
+    return browser
 
 
 async def try_restore_session(browser, session_json_str: str):

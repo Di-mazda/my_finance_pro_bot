@@ -31,6 +31,15 @@ async def global_error_handler(event: ErrorEvent):
     return True
 
 
+# ИЗМЕНЕНО (03.09.2026): _maybe_start_virtual_display() больше НЕ
+# вызывается из main() - функция оставлена ниже нетронутой (на случай,
+# если понадобится вернуть старое поведение), но подъём/остановка Xvfb
+# теперь происходит лениво прямо внутри services/tbank_client.py
+# (launch_browser/_acquire_virtual_display/_release_virtual_display):
+# дисплей поднимается непосредственно перед headful-браузером и гасится
+# сразу после закрытия последнего активного браузера, а не висит все
+# 24/7 работы бота впустую, потребляя лишние ~20-50 МБ, пока браузер
+# никому не нужен (см. разбор утечки памяти в чате от 03.09.2026).
 def _maybe_start_virtual_display():
     """
     НОВОЕ: опциональный запуск виртуального X-дисплея (Xvfb) через пакет
@@ -87,7 +96,10 @@ def _maybe_start_virtual_display():
 async def main():
     bot = Bot(token=TOKEN)
 
-    virtual_display = _maybe_start_virtual_display()
+    # ИЗМЕНЕНО (03.09.2026): не поднимаем Xvfb здесь на весь срок жизни
+    # процесса - см. комментарий над _maybe_start_virtual_display() выше.
+    # Было: virtual_display = _maybe_start_virtual_display()
+    virtual_display = None
     web_runner = None
 
     try:

@@ -11,6 +11,9 @@ from keyboards import get_main_reply_keyboard, get_cancel_keyboard
 from database import get_limits, get_phone_owner_info, get_user_info, set_user_phone_owner, set_user_session_json, add_user, set_user_phone
 from services import tbank_client
 from handlers.reports import download_and_send_report
+# НОВОЕ (03.09.2026): гасим сторожа (services/browser_watchdog.py) в
+# каждом месте, где браузер закрывается штатно - см. разбор утечки памяти.
+from services.browser_watchdog import cancel_watchdog
 
 from logger_config import logger
 
@@ -29,11 +32,14 @@ async def process_sms_code(message: Message, state: FSMContext):
     browser = data.get("browser")
     context = data.get("context")
     page = data.get("page")
+    watchdog_task = data.get("watchdog_task")
 
     if not page:
         end_point = data.get("end_point", "")
         is_authorized = end_point != "registration"
         await message.answer("❌ Ошибка: сессия потеряна. Начните заново", reply_markup=get_main_reply_keyboard(is_authorized))
+        # НОВОЕ (03.09.2026): гасим сторожа вместе с закрытием браузера.
+        cancel_watchdog(watchdog_task)
         if browser:
             await browser.close()
         await state.clear()
@@ -42,7 +48,8 @@ async def process_sms_code(message: Message, state: FSMContext):
     try:
         # Дальше может появиться либо форма ввода пароля, либо ввода пин-кода
         next_step = await tbank_client.submit_sms_code(page, sms_code)
-        await state.update_data(browser=browser, context=context, page=page)
+        # Было: await state.update_data(browser=browser, context=context, page=page)
+        await state.update_data(browser=browser, context=context, page=page, watchdog_task=watchdog_task)
 
         if next_step == "password":
             await state.set_state(Form.password)
@@ -64,6 +71,7 @@ async def process_sms_code(message: Message, state: FSMContext):
     except Exception as e:
         logger.exception(f"Ошибка при вводе смс-кода (user_id={message.from_user.id}): {e}") # type: ignore
         await message.answer(f"❌ Ошибка при вводе кода или неверный код. Ошибка: {e}")
+        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
         if browser:
             await browser.close()
         await state.clear()
@@ -81,11 +89,21 @@ async def process_password(message: Message, state: FSMContext):
     browser = data.get("browser")
     context = data.get("context")
     page = data.get("page")
+    watchdog_task = data.get("watchdog_task")
 
     if not page:
         end_point = data.get("end_point", "")
         is_authorized = end_point != "registration"
         await message.answer("❌ Ошибка: сессия потеряна. Начните заново", reply_markup=get_main_reply_keyboard(is_authorized))
+        # ИСПРАВЛЕНО (03.09.2026): раньше здесь браузер НЕ закрывался (в
+        # отличие от аналогичных веток в process_sms_code/process_pin) -
+        # это была настоящая утечка: если состояние "потерялось" именно на
+        # шаге пароля, browser оставался висеть в памяти навсегда. Заодно
+        # гасим сторожа, раз закрываем браузер сами.
+        # Было: await state.clear()
+        cancel_watchdog(watchdog_task)
+        if browser:
+            await browser.close()
         await state.clear()
         return
 
@@ -94,18 +112,21 @@ async def process_password(message: Message, state: FSMContext):
     except Exception as e:
         logger.exception(f"Ошибка при вводе пароля (user_id={message.from_user.id}): {e}") # type: ignore
         await message.answer(f"❌ Ошибка при вводе пароля. Ошибка: {e}")
+        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
         if browser:
             await browser.close()
         await state.clear()
         return
 
-    await state.update_data(browser=browser, context=context, page=page)
+    # Было: await state.update_data(browser=browser, context=context, page=page)
+    await state.update_data(browser=browser, context=context, page=page, watchdog_task=watchdog_task)
 
     try:
         await tbank_client.wait_for_pin_form(page)
     except Exception as e:
         logger.exception(f"Форма пин-кода не появилась после ввода пароля (user_id={message.from_user.id}): {e}") # type: ignore
         await message.answer(f"❌ Не дождались формы пин-кода после пароля. Ошибка: {e}")
+        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
         if browser:
             await browser.close()
         await state.clear()
@@ -137,11 +158,13 @@ async def process_pin(message: Message, state: FSMContext):
     browser = data.get("browser")
     context = data.get("context")
     page = data.get("page")
+    watchdog_task = data.get("watchdog_task")
 
     if not page:
         end_point = data.get("end_point", "")
         is_authorized = end_point != "registration"
         await message.answer("❌ Ошибка: сессия потеряна. Начните заново", reply_markup=get_main_reply_keyboard(is_authorized))
+        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
         if browser:
             await browser.close()
         await state.clear()
@@ -152,6 +175,7 @@ async def process_pin(message: Message, state: FSMContext):
     except Exception as e:
         logger.exception(f"Ошибка при вводе пин-кода (user_id={message.from_user.id}): {e}") # type: ignore
         await message.answer(f"❌ Ошибка при вводе пин-кода или неверный пин-код. Ошибка: {e}")
+        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
         if browser:
             await browser.close()
         await state.clear()
@@ -278,6 +302,9 @@ async def _after_login(message: Message, state: FSMContext):
         logger.exception(f"Ошибка в _after_login (user_id={user_id}, end_point={end_point!r}): {e}")
         await message.answer(f"❌ Ошибка при завершении входа. Ошибка: {e}")
     finally:
+        # НОВОЕ (03.09.2026): вход (успешно или нет) завершился - сторож
+        # больше не нужен, гасим его вместе с закрытием браузера.
+        cancel_watchdog(data.get("watchdog_task"))
         if browser:
             await browser.close()
         await state.clear()

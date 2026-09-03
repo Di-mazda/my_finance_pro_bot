@@ -11,6 +11,10 @@ from keyboards import get_main_reply_keyboard, get_cancel_keyboard, get_OK_keybo
 from database import add_pre_user, add_user, delete_user, get_pre_user_name, get_user_info, set_user_name, get_phone_owner_info, set_user_phone_owner
 from phone_utils import normalize_phone
 from services import tbank_client
+# НОВОЕ (03.09.2026): сторож, принудительно закрывающий браузер, если
+# пользователь бросит ввод смс/пароля/пин-кода на середине - см.
+# services/browser_watchdog.py и разбор утечки памяти в чате.
+from services.browser_watchdog import start_browser_watchdog, cancel_watchdog
 
 from logger_config import logger
 
@@ -137,13 +141,19 @@ async def process_phone(message: Message, state: FSMContext, playwright_instance
         # launch_browser, чтобы headless управлялся из одного места.
         # Было: browser = await tbank_client.launch_browser(playwright_instance, True)
         browser = await tbank_client.launch_browser(playwright_instance)
+        # НОВОЕ (03.09.2026): если пользователь пропадёт и не введёт
+        # смс/пароль/пин за 10 минут, браузер закроется сам (см.
+        # services/browser_watchdog.py) - без этого он мог провисеть в
+        # памяти бесконечно.
+        watchdog_task = start_browser_watchdog(browser, state, bot=message.bot, chat_id=message.chat.id)
         try:
             context = await browser.new_context()
             page = await context.new_page()
 
             await tbank_client.start_phone_login(page, phone)
 
-            await state.update_data(browser=browser, context=context, page=page)
+            # Было: await state.update_data(browser=browser, context=context, page=page)
+            await state.update_data(browser=browser, context=context, page=page, watchdog_task=watchdog_task)
             await state.set_state(Form.sms)
 
             await message.answer(
@@ -153,6 +163,11 @@ async def process_phone(message: Message, state: FSMContext, playwright_instance
             )
 
         except Exception as e:
+            # НОВОЕ (03.09.2026): гасим сторожа - браузер уже закрывается
+            # здесь штатно, повторное закрытие сторожем через 10 минут не
+            # нужно (и в этот момент state может принадлежать уже другому
+            # сценарию).
+            cancel_watchdog(watchdog_task)
             await browser.close()
             await state.clear()
             await message.answer(f"❌ Ошибка при авторизации. Ошибка: {e}")

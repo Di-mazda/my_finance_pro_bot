@@ -16,6 +16,15 @@ from keyboards import (
 from database import get_limits, get_user_session_json, get_user_info, get_phone_owner_info, delete_user, has_plan_for_month
 from services import tbank_client
 from services.report_service import build_budget_report_text
+# НОВОЕ (03.09.2026): сторож, принудительно закрывающий "подвешенный"
+# браузер (см. services/browser_watchdog.py и разбор утечки памяти в
+# чате). В этом файле браузер открывается сразу в нескольких сценариях
+# (вход владельца, вход не-owner, ожидание подтверждения владельцем) -
+# без сторожа именно ожидание подтверждения владельцем могло не
+# закрыться никогда, если владелец просто не отвечал (см. комментарий в
+# _request_report_for_non_owner ниже - раньше это было явно описано как
+# известное нерешённое ограничение).
+from services.browser_watchdog import start_browser_watchdog, cancel_watchdog
 # НОВОЕ: автоматический пересчёт лимитов по общему бюджету перед показом
 # отчёта (если у пользователя заведён план - см. handlers/planning.py и
 # services/budget_forecast.py). Если плана нет, recalc_month_limits вернёт
@@ -97,6 +106,10 @@ async def _send_report_for_owner(message: Message, state: FSMContext, playwright
     await message.answer("⏳ Авторизуюсь в Т-Банке, пожалуйста ожидайте...")
 
     browser = await tbank_client.launch_browser(playwright_instance)
+    # НОВОЕ (03.09.2026): страхуемся от зависания на любом из следующих
+    # шагов (start_phone_login/ввод смс/пароля/пин-кода) - через 10 минут
+    # браузер закроется сам, даже если пользователь пропадёт.
+    watchdog_task = start_browser_watchdog(browser, state, bot=message.bot, chat_id=message.chat.id)
 
     try:
         context, page, reused = None, None, False
@@ -109,6 +122,7 @@ async def _send_report_for_owner(message: Message, state: FSMContext, playwright
             # (services/budget_forecast.py) мог найти план пользователя.
             # Было: await download_and_send_report(message.bot, message.chat.id, month, limits, context, page)
             await download_and_send_report(message.bot, message.chat.id, month, limits, context, page, phone=user_phone)
+            cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026): браузер закрывается штатно ниже
             await browser.close()
             await state.clear()
             return
@@ -119,7 +133,8 @@ async def _send_report_for_owner(message: Message, state: FSMContext, playwright
 
         await tbank_client.start_phone_login(page, user_phone)
 
-        await state.update_data(browser=browser, context=context, page=page, month=month, limits=limits)
+        # Было: await state.update_data(browser=browser, context=context, page=page, month=month, limits=limits)
+        await state.update_data(browser=browser, context=context, page=page, month=month, limits=limits, watchdog_task=watchdog_task)
         await state.set_state(Form.sms)
         await message.answer(
             f"💬 Т-Банк отправил код для входа на номер {user_phone}. Пожалуйста, введите код сюда в чат."
@@ -130,6 +145,7 @@ async def _send_report_for_owner(message: Message, state: FSMContext, playwright
 
     except Exception as e:
         logger.exception(f"Ошибка при авторизации в Т-Банке (user_id={user_id}, месяц={month}): {e}")
+        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
         await browser.close()
         await state.clear()
         await message.answer(f"❌ Ошибка при авторизации. Ошибка: {e}")
@@ -160,6 +176,12 @@ async def _request_report_for_non_owner(message: Message, state: FSMContext, pla
     владелец сам не отреагирует на запрос (подтвердит или отклонит) -
     т.к. общий cancel-хендлер в handlers/start.py проверяет browser только
     в состоянии текущего (запрашивающего) пользователя.
+
+    ИСПРАВЛЕНО (03.09.2026): абзац выше был реальной причиной утечки
+    памяти - если владелец никогда не нажимал ни одну из кнопок, browser
+    висел в owner_state вечно. Теперь на этот browser вешается сторож
+    (services/browser_watchdog.py, см. _OWNER_CONFIRMATION_TIMEOUT_SECONDS
+    ниже) - он закроется сам, даже если владелец так и не отреагирует.
     """
     owner_info = await get_phone_owner_info(phone)
 
@@ -201,6 +223,21 @@ async def _request_report_for_non_owner(message: Message, state: FSMContext, pla
         storage=state.storage,
         key=StorageKey(bot_id=message.bot.id, chat_id=owner_id, user_id=owner_id) # type: ignore
     )
+
+    # НОВОЕ (03.09.2026): если browser открыт (session_valid=True) - вешаем
+    # на него сторожа. Таймаут больше стандартных 10 минут (см.
+    # services/browser_watchdog.py:DEFAULT_MAX_LIFETIME_SECONDS), т.к. тут
+    # браузер ждёт не активный ввод, а реакцию владельца на уведомление -
+    # человек может увидеть его не сразу. Но бесконечно висеть в памяти
+    # ему тоже нельзя - см. "ИСПРАВЛЕНО" в докстринге функции выше.
+    _OWNER_CONFIRMATION_TIMEOUT_SECONDS = 30 * 60  # 30 минут
+    watchdog_task = None
+    if browser is not None:
+        watchdog_task = start_browser_watchdog(
+            browser, owner_state, bot=message.bot, chat_id=owner_id,
+            max_lifetime=_OWNER_CONFIRMATION_TIMEOUT_SECONDS,
+        )
+
     await owner_state.update_data(
         browser=browser,
         context=context,
@@ -210,6 +247,7 @@ async def _request_report_for_non_owner(message: Message, state: FSMContext, pla
         phone=phone,
         session_valid=session_valid,
         report_recipient_id=requester_id,
+        watchdog_task=watchdog_task,  # НОВОЕ (03.09.2026)
     )
 
     # А в состоянии ЗАПРАШИВАЮЩЕГО - то, что нужно, чтобы он мог сам
@@ -255,6 +293,7 @@ async def _request_report_for_non_owner(message: Message, state: FSMContext, pla
         # запись больше не актуальна, удаляем её.
         logger.info(f"Пользователь {owner_id} заблокировал бота - не удалось отправить запрос на отчёт.")
         await delete_user(owner_id)
+        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
         if browser:
             await browser.close()
         await state.clear()
@@ -300,6 +339,8 @@ async def requester_self_login_handler(message: Message, state: FSMContext, play
     await message.answer("⏳ Авторизуюсь в Т-Банке, пожалуйста ожидайте...", reply_markup=get_main_reply_keyboard())
 
     browser = await tbank_client.launch_browser(playwright_instance)
+    # НОВОЕ (03.09.2026): страхуемся от зависания на шагах смс/пароля/пина.
+    watchdog_task = start_browser_watchdog(browser, state, bot=message.bot, chat_id=message.chat.id)
     try:
         context = await browser.new_context()
         page = await context.new_page()
@@ -310,6 +351,7 @@ async def requester_self_login_handler(message: Message, state: FSMContext, play
             month=month, limits=limits,
             report_recipient_id=requester_id,
             session_owner_id=owner_id,
+            watchdog_task=watchdog_task,  # НОВОЕ (03.09.2026)
         )
         await state.set_state(Form.sms)
         await message.answer(
@@ -320,6 +362,7 @@ async def requester_self_login_handler(message: Message, state: FSMContext, play
         )
     except Exception as e:
         logger.exception(f"Ошибка при самостоятельном входе не-owner пользователя (requester_id={requester_id}): {e}")
+        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
         await browser.close()
         await state.clear()
         await message.answer(f"❌ Ошибка при авторизации. Ошибка: {e}")
@@ -343,6 +386,7 @@ async def owner_confirm_report_handler(callback: CallbackQuery, state: FSMContex
     limits = data.get("limits")
     phone = data.get("phone")
     browser = data.get("browser")
+    watchdog_task = data.get("watchdog_task")
 
     await callback.answer()
 
@@ -354,6 +398,9 @@ async def owner_confirm_report_handler(callback: CallbackQuery, state: FSMContex
         # Было: await download_and_send_report(callback.bot, requester_id, month, limits, context, page)
         await download_and_send_report(callback.bot, requester_id, month, limits, context, page, phone=phone)
 
+        # НОВОЕ (03.09.2026): гасим сторожа, запущенного в
+        # _request_report_for_non_owner - браузер закрывается штатно ниже.
+        cancel_watchdog(watchdog_task)
         if browser:
             await browser.close()
 
@@ -376,18 +423,26 @@ async def owner_confirm_report_handler(callback: CallbackQuery, state: FSMContex
     # Сессии не было / она протухла - запускаем полноценный вход владельца.
     # Итоговый отчёт после входа уйдёт запрашивающему (report_recipient_id),
     # а не самому владельцу - это учитывается в _after_login.
+    # НОВОЕ (03.09.2026): предыдущий сторож (если был - на невалидную
+    # сессию он не вешался, но на всякий случай) больше не актуален, тут
+    # начинается совсем новый вход со своим собственным браузером.
+    cancel_watchdog(watchdog_task)
+
     await callback.message.answer("⏳ Авторизуюсь в Т-Банке, пожалуйста ожидайте...") # type: ignore
 
     browser = await tbank_client.launch_browser(playwright_instance)
+    watchdog_task = start_browser_watchdog(browser, state, bot=callback.bot, chat_id=owner_id)  # НОВОЕ (03.09.2026)
     try:
         context = await browser.new_context()
         page = await context.new_page()
         await tbank_client.start_phone_login(page, phone)
 
+        # Было: await state.update_data(browser=browser, context=context, page=page, month=month, limits=limits, report_recipient_id=requester_id)
         await state.update_data(
             browser=browser, context=context, page=page,
             month=month, limits=limits,
             report_recipient_id=requester_id,
+            watchdog_task=watchdog_task,  # НОВОЕ (03.09.2026)
         )
         await state.set_state(Form.sms)
         await callback.message.answer( # type: ignore
@@ -405,6 +460,7 @@ async def owner_confirm_report_handler(callback: CallbackQuery, state: FSMContex
             logger.info(f"Пользователь {requester_id} заблокировал бота.")
     except Exception as e:
         logger.exception(f"Ошибка при авторизации владельца по запросу отчёта (owner_id={owner_id}): {e}")
+        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
         await browser.close()
         await state.clear()
         await callback.message.answer(f"❌ Ошибка при авторизации. Ошибка: {e}") # type: ignore
@@ -417,6 +473,7 @@ async def owner_decline_report_handler(callback: CallbackQuery, state: FSMContex
 
     data = await state.get_data()
     browser = data.get("browser")
+    cancel_watchdog(data.get("watchdog_task"))  # НОВОЕ (03.09.2026)
     if browser:
         await browser.close()
     await state.clear()
