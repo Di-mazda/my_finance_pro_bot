@@ -126,7 +126,18 @@ async def launch_browser(playwright_instance, headless: bool | None = None):
         await _acquire_virtual_display()
 
     try:
-        browser = await playwright_instance.chromium.launch(headless=headless)
+        # ИСПРАВЛЕНО (03.09.2026, регрессия от правки того же дня): async_playwright()
+        # в main.py поднимает Node.js-драйвер Playwright ОДИН РАЗ при старте бота, и
+        # этот драйвер наследует переменные окружения (в т.ч. DISPLAY) от Python-
+        # процесса именно в момент своего запуска - позже установленные переменные
+        # в уже работающий дочерний процесс не попадают. Ленивый _acquire_virtual_display()
+        # выше выставляет DISPLAY через pyvirtualdisplay уже ПОСЛЕ старта драйвера,
+        # поэтому Chrome в headful-режиме падал с "Missing X server or $DISPLAY" -
+        # именно эта ошибка и была в проде. Чтобы новый DISPLAY всё-таки дошёл до
+        # процесса браузера, передаём актуальное окружение явно через параметр env=
+        # (Playwright поддерживает его специально для таких случаев).
+        # Было: browser = await playwright_instance.chromium.launch(headless=headless)
+        browser = await playwright_instance.chromium.launch(headless=headless, env=dict(os.environ))
     except Exception:
         # Запуск не удался - сразу отдаём обратно то, что успели занять.
         if not headless:
