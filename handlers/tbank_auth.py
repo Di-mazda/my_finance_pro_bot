@@ -10,6 +10,12 @@ from forms.user import Form
 from keyboards import get_main_reply_keyboard, get_cancel_keyboard
 from database import get_limits, get_phone_owner_info, get_user_info, set_user_phone_owner, set_user_session_json, add_user, set_user_phone
 from services import tbank_client
+# ИЗМЕНЕНО: убран импорт верхнего уровня
+#   from handlers.reports import download_and_send_report
+# Он создавал циклический импорт (reports.py импортирует tbank_auth).
+# Функция импортируется лениво внутри _after_login.
+# НОВОЕ (03.09.2026): гасим сторожа (services/browser_watchdog.py) в
+# каждом месте, где браузер закрывается штатно - см. разбор утечки памяти.
 from services.browser_watchdog import cancel_watchdog
 
 from logger_config import logger
@@ -20,28 +26,22 @@ router = Router()
 # ============================================================================
 # ЦИКЛ АВТОРИЗАЦИИ (диспетчер) - см. диаграмму "КАК ДОЛЖНО РАБОТАТЬ".
 # ============================================================================
-# Раньше поток входа был линейным и жёстко зашитым: process_sms_code сам
-# знал, что дальше пароль или пин; process_password сам ждал пин. Любой
-# неожиданный шаг банка ломал сценарий и вход начинался с телефона заново.
-#
-# Теперь всё крутится вокруг get_page_type. advance_auth - единая точка,
-# которая:
+# advance_auth - единая точка, которая:
 #   1) спрашивает get_page_type "какая форма сейчас открыта?";
-#   2) для форм, требующих данных от пользователя (sms/password/pin) -
-#      ставит нужный set_state, просит ввод в чат и ВЫХОДИТ (ждёт ответ);
-#   3) для шагов, которые можно пройти без пользователя (phone - ввести
-#      номер из state; bio - скипнуть) - выполняет действие и снова зовёт
-#      саму себя (это и есть "стрелка назад в get_page_type" на диаграмме);
+#   2) для форм, требующих данных (sms/password/pin) - ставит set_state,
+#      просит ввод в чат и ВЫХОДИТ (ждёт ответ);
+#   3) для шагов без пользователя (phone - ввести номер из state; bio -
+#      скипнуть) - выполняет действие и снова зовёт себя (стрелка назад
+#      в get_page_type на диаграмме);
 #   4) для lk - вызывает _after_login (end_point);
-#   5) для blocked/unknown/ошибок - аккуратно завершает вход с сообщением.
+#   5) для blocked/unknown/ошибок - аккуратно завершает вход.
 #
-# Каждый process_* хендлер ниже теперь только вводит свои данные и в конце
-# снова зовёт advance_auth - т.е. управление всегда возвращается к
-# get_page_type, ровно как на схеме.
+# just_submitted: тип формы, которую только что отправил пользователь
+# (или мы сами). Пробрасывается в get_page_type как gone_type, чтобы тот
+# СНАЧАЛА дождался исчезновения этой формы и только потом смотрел, что
+# банк показал дальше. Без этого сразу после ввода пина старая форма ещё
+# в DOM и шаг зацикливался ("ввёл пин -> опять просит пин").
 
-# Максимум переходов за один "прогон" advance_auth без ожидания ввода от
-# пользователя - страховка от бесконечного цикла, если банк вдруг начнёт
-# отдавать форму, которую мы не умеем закрывать сами.
 _MAX_AUTOSTEPS = 10
 
 
@@ -59,7 +59,7 @@ async def _fail_auth(message: Message, state: FSMContext, text: str):
     await state.clear()
 
 
-async def advance_auth(message: Message, state: FSMContext):
+async def advance_auth(message: Message, state: FSMContext, just_submitted: str | None = None):
     """
     Диспетчер шага авторизации. Смотрит get_page_type и либо запрашивает у
     пользователя данные (и выходит), либо сам проходит шаг и повторяет,
@@ -73,13 +73,19 @@ async def advance_auth(message: Message, state: FSMContext):
         await _fail_auth(message, state, "❌ Ошибка: сессия потеряна. Начните заново.")
         return
 
+    # gone_type действует только на ПЕРВЫЙ вызов get_page_type в этом
+    # прогоне - для шагов, которые мы проходим сами (phone/bio), ждать
+    # исчезновения уже не нужно.
+    gone = just_submitted
+
     for _ in range(_MAX_AUTOSTEPS):
         try:
-            page_type = await tbank_client.get_page_type(page)
+            page_type = await tbank_client.get_page_type(page, gone_type=gone)
         except Exception as e:
             logger.exception(f"advance_auth: get_page_type упал (user_id={message.from_user.id}): {e}")  # type: ignore
             await _fail_auth(message, state, f"❌ Не удалось определить состояние входа. Ошибка: {e}")
             return
+        gone = None  # дальше в цикле ждать исчезновения нечего
 
         # --- Формы, требующие данных от пользователя: просим ввод и выходим ---
         if page_type == "sms":
@@ -114,8 +120,6 @@ async def advance_auth(message: Message, state: FSMContext):
 
         # --- Шаги, которые проходим сами и снова зовём get_page_type ---
         elif page_type == "phone":
-            # Мы на форме номера, а номер уже известен из state - вводим его
-            # сами и продолжаем цикл (не гоняем пользователя вводить телефон).
             if not phone:
                 await _fail_auth(message, state, "❌ Ошибка входа: номер телефона не задан.")
                 return
@@ -146,8 +150,7 @@ async def advance_auth(message: Message, state: FSMContext):
             logger.warning(f"advance_auth: банк показал 'Доступ заблокирован' (user_id={message.from_user.id})")  # type: ignore
             await _fail_auth(
                 message, state,
-                "❌ Т-Банк заблокировал автоматический вход (антифрод). "
-                "Попробуйте позже.",
+                "❌ Т-Банк заблокировал автоматический вход (антифрод). Попробуйте позже.",
             )
             return
 
@@ -158,7 +161,6 @@ async def advance_auth(message: Message, state: FSMContext):
             )
             return
 
-    # Вышли из цикла, ни разу не попросив ввод и не дойдя до ЛК.
     await _fail_auth(message, state, "❌ Вход зациклился на неизвестном шаге. Попробуйте заново.")
 
 
@@ -184,8 +186,8 @@ async def process_sms_code(message: Message, state: FSMContext):
         await _fail_auth(message, state, f"❌ Ошибка при вводе кода или неверный код. Ошибка: {e}")
         return
 
-    # Управление снова уходит в get_page_type - он решит, что дальше.
-    await advance_auth(message, state)
+    # Ждём, пока форма смс сменится, и решаем, что дальше.
+    await advance_auth(message, state, just_submitted="sms")
 
 
 # --- ХЕНДЛЕР ВВОДА ПАРОЛЯ ---
@@ -210,7 +212,7 @@ async def process_password(message: Message, state: FSMContext):
         await _fail_auth(message, state, f"❌ Ошибка при вводе пароля. Ошибка: {e}")
         return
 
-    await advance_auth(message, state)
+    await advance_auth(message, state, just_submitted="password")
 
 
 # --- ВВОД ПИН-КОДА ---
@@ -240,7 +242,9 @@ async def process_pin(message: Message, state: FSMContext):
         await _fail_auth(message, state, f"❌ Ошибка при вводе пин-кода или неверный пин-код. Ошибка: {e}")
         return
 
-    await advance_auth(message, state)
+    # just_submitted="pin" - get_page_type сперва дождётся, пока форма
+    # пин-кода исчезнет (иначе тут же снова определил бы её как pin).
+    await advance_auth(message, state, just_submitted="pin")
 
 
 async def _after_login(message: Message, state: FSMContext):
@@ -289,8 +293,7 @@ async def _after_login(message: Message, state: FSMContext):
             # который заведены категории/лимиты (владельца), уже вычислен
             # чуть выше в этой функции.
             # Было: await download_and_send_report(message.bot, report_recipient_id, month, limits, context, page)
-            # ЛЕНИВЫЙ импорт (см. комментарий у импортов вверху файла) -
-            # разрывает цикл reports <-> tbank_auth.
+            # ЛЕНИВЫЙ импорт - разрывает цикл reports <-> tbank_auth.
             from handlers.reports import download_and_send_report
             await download_and_send_report(message.bot, report_recipient_id, month, limits, context, page, phone=phone)
 
