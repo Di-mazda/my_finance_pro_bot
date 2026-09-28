@@ -11,9 +11,6 @@ from keyboards import get_main_reply_keyboard, get_cancel_keyboard, get_OK_keybo
 from database import add_pre_user, add_user, delete_user, get_pre_user_name, get_user_info, set_user_name, get_phone_owner_info, set_user_phone_owner
 from phone_utils import normalize_phone
 from services import tbank_client
-# НОВОЕ (03.09.2026): сторож, принудительно закрывающий браузер, если
-# пользователь бросит ввод смс/пароля/пин-кода на середине - см.
-# services/browser_watchdog.py и разбор утечки памяти в чате.
 from services.browser_watchdog import start_browser_watchdog, cancel_watchdog
 
 from logger_config import logger
@@ -134,39 +131,25 @@ async def process_phone(message: Message, state: FSMContext, playwright_instance
         await message.answer("Хорошо! Давайте убедимся, что этот номер действительно ваш, пройдите, пожалуйста, быструю авторизацию в <b>Т-Банке</b>.", parse_mode="HTML")
         await message.answer("⏳ Авторизуюсь в Т-Банке, пожалуйста ожидайте...")
 
-        # ИЗМЕНЕНО: раньше здесь был жёстко зашит headless=True, из-за чего
-        # переменная окружения BROWSER_HEADLESS (см. services/tbank_client.py)
-        # тут бы не сработала, даже если её выставить. Теперь используем
-        # значение по умолчанию, как и в остальных местах вызова
-        # launch_browser, чтобы headless управлялся из одного места.
-        # Было: browser = await tbank_client.launch_browser(playwright_instance, True)
         browser = await tbank_client.launch_browser(playwright_instance)
-        # НОВОЕ (03.09.2026): если пользователь пропадёт и не введёт
-        # смс/пароль/пин за 10 минут, браузер закроется сам (см.
-        # services/browser_watchdog.py) - без этого он мог провисеть в
-        # памяти бесконечно.
         watchdog_task = start_browser_watchdog(browser, state, bot=message.bot, chat_id=message.chat.id)
         try:
-            context = await browser.new_context()
+            context = await tbank_client.new_context(browser)  # ИЗМЕНЕНО: фабрика (ignore_https_errors)
             page = await context.new_page()
 
             await tbank_client.start_phone_login(page, phone)
 
-            # Было: await state.update_data(browser=browser, context=context, page=page)
-            await state.update_data(browser=browser, context=context, page=page, watchdog_task=watchdog_task)
-            await state.set_state(Form.sms)
+            await state.update_data(browser=browser, context=context, page=page, phone=phone, watchdog_task=watchdog_task)
 
-            await message.answer(
-                f"💬 Т-Банк отправил код для входа на номер {phone}. Пожалуйста, введите код сюда в чат.\n"
-                "🛡️<b>Не переживайте о безопасности:</b> мы не храним ваши пароли и коды, а ради вашей безопасности <b><i>сообщение с кодом автоматически удалится из этого чата</i></b> у вас и у нас.",
-                parse_mode="HTML"
-            )
+            # ИЗМЕНЕНО: не ставим Form.sms вслепую - управление идёт в цикл
+            # авторизации, который через get_page_type сам определит форму
+            # (смс / сразу пароль / пин) и запросит нужные данные. Импорт
+            # локальный, чтобы не создавать цикл импортов между account и
+            # tbank_auth (оба тянут services.tbank_client).
+            from handlers.tbank_auth import advance_auth
+            await advance_auth(message, state)
 
         except Exception as e:
-            # НОВОЕ (03.09.2026): гасим сторожа - браузер уже закрывается
-            # здесь штатно, повторное закрытие сторожем через 10 минут не
-            # нужно (и в этот момент state может принадлежать уже другому
-            # сценарию).
             cancel_watchdog(watchdog_task)
             await browser.close()
             await state.clear()

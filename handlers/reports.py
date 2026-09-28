@@ -7,6 +7,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.exceptions import TelegramForbiddenError
 
 from forms.user import Form
+from handlers import tbank_auth
 from keyboards import (
     get_cancel_keyboard,
     get_main_reply_keyboard,
@@ -69,13 +70,6 @@ async def _send_month_report(message: Message, state: FSMContext, playwright_ins
         return
     user_phone, user_name, is_phone_owner = user_info
 
-    # ИЗМЕНЕНО: раньше здесь проверялось наличие уже посчитанных лимитов
-    # (limits) и, если их не было, предлагалось скопировать лимиты с
-    # соседнего месяца. Теперь лимиты - производная от плана (см.
-    # handlers/planning.py и services/budget_forecast.py): download_and_send_report
-    # ниже сам пересчитает их из плана прямо перед отчётом (recalc_month_limits).
-    # Поэтому единственное, что нужно проверить заранее - заведён ли вообще
-    # план (ЗП и/или траты по категориям) на этот месяц.
     if not await has_plan_for_month(user_phone, month):
         month_string = month.strftime("%m.%Y")
         await message.answer(
@@ -106,46 +100,32 @@ async def _send_report_for_owner(message: Message, state: FSMContext, playwright
     await message.answer("⏳ Авторизуюсь в Т-Банке, пожалуйста ожидайте...")
 
     browser = await tbank_client.launch_browser(playwright_instance)
-    # НОВОЕ (03.09.2026): страхуемся от зависания на любом из следующих
-    # шагов (start_phone_login/ввод смс/пароля/пин-кода) - через 10 минут
-    # браузер закроется сам, даже если пользователь пропадёт.
     watchdog_task = start_browser_watchdog(browser, state, bot=message.bot, chat_id=message.chat.id)
 
     try:
-        context, page, reused = None, None, False
+        context, page = await tbank_client.restore_session(browser, saved_session_str)
 
-        if saved_session_str:
-            context, page, reused = await tbank_client.try_restore_session(browser, saved_session_str)
+        # ИСПРАВЛЕНО: get_page_type - корутина, её надо await (иначе page_type
+        # был бы объектом корутины и никогда не равнялся 'lk').
+        page_type = await tbank_client.get_page_type(page)
 
-        if reused:
-            # ИЗМЕНЕНО: добавлен phone=user_phone, чтобы автопересчёт лимитов
-            # (services/budget_forecast.py) мог найти план пользователя.
-            # Было: await download_and_send_report(message.bot, message.chat.id, month, limits, context, page)
+        if page_type == 'lk':
             await download_and_send_report(message.bot, message.chat.id, month, limits, context, page, phone=user_phone)
-            cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026): браузер закрывается штатно ниже
+            cancel_watchdog(watchdog_task)
             await browser.close()
             await state.clear()
             return
 
-        if context is None:
-            context = await browser.new_context()
-            page = await context.new_page()
-
-        await tbank_client.start_phone_login(page, user_phone)
-
-        # Было: await state.update_data(browser=browser, context=context, page=page, month=month, limits=limits)
-        await state.update_data(browser=browser, context=context, page=page, month=month, limits=limits, watchdog_task=watchdog_task)
-        await state.set_state(Form.sms)
-        await message.answer(
-            f"💬 Т-Банк отправил код для входа на номер {user_phone}. Пожалуйста, введите код сюда в чат."
-            "Мы не храним ваши пароли и коды! <b><i>Сообщение с кодом автоматически удалится из этого чата.</i></b>",
-            parse_mode="HTML",
-            reply_markup=get_cancel_keyboard()
-        )
+        # Сессия протухла - продолжаем вход через единый цикл авторизации
+        # (см. handlers/tbank_auth.advance_auth). Он сам определит по
+        # get_page_type, что показал банк (телефон/смс/пароль/пин), и
+        # проведёт до конца, а на lk вызовет _after_login.
+        await state.update_data(browser=browser, context=context, page=page, month=month, limits=limits, watchdog_task=watchdog_task, phone=user_phone)
+        await tbank_auth.advance_auth(message, state)
 
     except Exception as e:
         logger.exception(f"Ошибка при авторизации в Т-Банке (user_id={user_id}, месяц={month}): {e}")
-        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
+        cancel_watchdog(watchdog_task) 
         await browser.close()
         await state.clear()
         await message.answer(f"❌ Ошибка при авторизации. Ошибка: {e}")
@@ -204,18 +184,8 @@ async def _request_report_for_non_owner(message: Message, state: FSMContext, pla
 
     saved_session_str = await get_user_session_json(owner_id)
 
-    session_valid = False
-    browser = context = page = None
-
-    if saved_session_str:
-        browser = await tbank_client.launch_browser(playwright_instance)
-        context, page, session_valid = await tbank_client.try_restore_session(browser, saved_session_str)
-        if not session_valid:
-            # Сессия протухла - открытый browser сейчас не нужен: логиниться
-            # заново будет либо владелец, либо сам запрашивающий, и в обоих
-            # случаях они откроют СВОЙ browser в своём хендлере.
-            await browser.close()
-            browser = context = page = None
+    browser = await tbank_client.launch_browser(playwright_instance)
+    context, page = await tbank_client.restore_session(browser, saved_session_str)
 
     # Сохраняем данные запроса в состоянии ВЛАДЕЛЬЦА - именно он будет
     # нажимать кнопки подтверждения/отклонения и вводить пин-код.
@@ -245,55 +215,41 @@ async def _request_report_for_non_owner(message: Message, state: FSMContext, pla
         month=month,
         limits=limits,
         phone=phone,
-        session_valid=session_valid,
         report_recipient_id=requester_id,
-        watchdog_task=watchdog_task,  # НОВОЕ (03.09.2026)
+        watchdog_task=watchdog_task
     )
 
     # А в состоянии ЗАПРАШИВАЮЩЕГО - то, что нужно, чтобы он мог сам
-    # попробовать войти (см. requester_self_login_handler).
     await state.update_data(owner_id=owner_id, phone=phone, month=month, limits=limits)
     await state.set_state(Form.waiting_owner_action)
 
     month_string = month.strftime("%m.%Y")
 
-    if session_valid:
-        owner_text = (
-            f"Пользователь <a href='tg://user?id={requester_id}'>{requester_name}</a> "
-            f"хочет посмотреть отчёт за {month_string}.\n\n"
-            "Ваша сессия в Т-Банке ещё активна. Подтвердите доступ, или отклоните запрос."
-        )
-        requester_text = (
-            "⏳ Для формирования отчёта нужно подтверждение владельца номера - "
-            "отправил ему запрос на подтверждение.\n\n"
-            "Если вы знаете пин-код от Т-Банка владельца, можете ввести данные "
-            "самостоятельно, не дожидаясь его ответа:"
-        )
-    else:
-        owner_text = (
-            f"Пользователь <a href='tg://user?id={requester_id}'>{requester_name}</a> "
-            f"хочет посмотреть отчёт за {month_string}, но ваша сессия в Т-Банке истекла.\n\n"
-            "Авторизуйтесь заново, чтобы отчёт был отправлен этому пользователю."
-        )
-        requester_text = (
-            "⏳ Сессия владельца номера истекла - отправил ему запрос на повторный вход.\n\n"
-            "Если вы знаете данные для входа в Т-Банк владельца (пароль/пин), можете "
-            "попробовать войти самостоятельно, не дожидаясь его:"
-        )
+    owner_text = (
+        f"Пользователь <a href='tg://user?id={requester_id}'>{requester_name}</a> "
+        f"хочет посмотреть отчёт за {month_string}.\n\n"
+        "Подтвердите доступ, или отклоните запрос."
+    )
+    requester_text = (
+        "⏳ Для формирования отчёта нужно подтверждение владельца номера - "
+        "отправил ему запрос на подтверждение.\n\n"
+        "Если вы знаете данные для входа в Т-Банка владельца, можете ввести данные "
+        "самостоятельно, не дожидаясь его ответа:"
+    )
 
     try:
         await message.bot.send_message( # type: ignore
             chat_id=owner_id,
             text=owner_text,
             parse_mode="HTML",
-            reply_markup=get_report_request_owner_keyboard(requester_id, session_valid=session_valid)
+            reply_markup=get_report_request_owner_keyboard(requester_id)
         )
     except TelegramForbiddenError:
         # если владелец заблокировал бота, его
         # запись больше не актуальна, удаляем её.
         logger.info(f"Пользователь {owner_id} заблокировал бота - не удалось отправить запрос на отчёт.")
         await delete_user(owner_id)
-        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
+        cancel_watchdog(watchdog_task) 
         if browser:
             await browser.close()
         await state.clear()
@@ -339,27 +295,23 @@ async def requester_self_login_handler(message: Message, state: FSMContext, play
     await message.answer("⏳ Авторизуюсь в Т-Банке, пожалуйста ожидайте...", reply_markup=get_main_reply_keyboard())
 
     browser = await tbank_client.launch_browser(playwright_instance)
-    # НОВОЕ (03.09.2026): страхуемся от зависания на шагах смс/пароля/пина.
     watchdog_task = start_browser_watchdog(browser, state, bot=message.bot, chat_id=message.chat.id)
     try:
-        context = await browser.new_context()
+        context = await tbank_client.new_context(browser)  # ИЗМЕНЕНО: фабрика (ignore_https_errors)
         page = await context.new_page()
         await tbank_client.start_phone_login(page, phone)
 
         await state.update_data(
             browser=browser, context=context, page=page,
-            month=month, limits=limits,
+            month=month, limits=limits, phone=phone,
             report_recipient_id=requester_id,
             session_owner_id=owner_id,
             watchdog_task=watchdog_task,  # НОВОЕ (03.09.2026)
         )
-        await state.set_state(Form.sms)
-        await message.answer(
-            f"💬 Т-Банк отправил код для входа на номер {phone}. Пожалуйста, введите код сюда в чат.\n"
-            "Мы не храним ваши пароли и коды! <b><i>Сообщение с кодом автоматически удалится из этого чата.</i></b>",
-            reply_markup=get_cancel_keyboard(),
-            parse_mode="HTML"
-        )
+        # ИЗМЕНЕНО: не ставим Form.sms вслепую - отдаём управление циклу
+        # авторизации, он сам через get_page_type определит форму и запросит
+        # нужные данные (см. handlers/tbank_auth.advance_auth).
+        await tbank_auth.advance_auth(message, state)
     except Exception as e:
         logger.exception(f"Ошибка при самостоятельном входе не-owner пользователя (requester_id={requester_id}): {e}")
         cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
@@ -379,7 +331,6 @@ async def owner_confirm_report_handler(callback: CallbackQuery, state: FSMContex
     requester_id = int(callback.data.removeprefix("owner_confirm_report:")) # type: ignore
 
     data = await state.get_data()
-    session_valid = data.get("session_valid", False)
     context = data.get("context")
     page = data.get("page")
     month = data.get("month")
@@ -390,22 +341,21 @@ async def owner_confirm_report_handler(callback: CallbackQuery, state: FSMContex
 
     await callback.answer()
 
-    if session_valid and context is not None and page is not None:
+    page_type = await tbank_client.get_page_type(page)  # ИСПРАВЛЕНО: await
+
+    if page_type=="lk" and context is not None and page is not None:
         await callback.message.answer("✅ Доступ подтверждён. Формирую отчёт для пользователя...", reply_markup=get_main_reply_keyboard())
 
-        # ИЗМЕНЕНО: добавлен phone=phone (план и лимиты привязаны к номеру
-        # владельца, а не к requester_id) - см. services/budget_forecast.py.
-        # Было: await download_and_send_report(callback.bot, requester_id, month, limits, context, page)
         await download_and_send_report(callback.bot, requester_id, month, limits, context, page, phone=phone)
 
-        # НОВОЕ (03.09.2026): гасим сторожа, запущенного в
-        # _request_report_for_non_owner - браузер закрывается штатно ниже.
         cancel_watchdog(watchdog_task)
         if browser:
             await browser.close()
 
         try:
-            await message.bot.send_message( # type: ignore
+            # ИСПРАВЛЕНО: было message.bot - но в этом хендлере есть только
+            # callback, переменной message не существует (NameError).
+            await callback.bot.send_message( # type: ignore
                 chat_id=requester_id,
                 text="✅ Владелец номера подтвердил доступ, отчёт готов."
             )
@@ -433,23 +383,16 @@ async def owner_confirm_report_handler(callback: CallbackQuery, state: FSMContex
     browser = await tbank_client.launch_browser(playwright_instance)
     watchdog_task = start_browser_watchdog(browser, state, bot=callback.bot, chat_id=owner_id)  # НОВОЕ (03.09.2026)
     try:
-        context = await browser.new_context()
+        context = await tbank_client.new_context(browser)  # ИЗМЕНЕНО: фабрика (ignore_https_errors)
         page = await context.new_page()
         await tbank_client.start_phone_login(page, phone)
 
         # Было: await state.update_data(browser=browser, context=context, page=page, month=month, limits=limits, report_recipient_id=requester_id)
         await state.update_data(
             browser=browser, context=context, page=page,
-            month=month, limits=limits,
+            month=month, limits=limits, phone=phone,
             report_recipient_id=requester_id,
             watchdog_task=watchdog_task,  # НОВОЕ (03.09.2026)
-        )
-        await state.set_state(Form.sms)
-        await callback.message.answer( # type: ignore
-            f"💬 Т-Банк отправил код для входа на номер {phone}. Пожалуйста, введите код сюда в чат.\n"
-            f"Мы не храним ваши пароли и коды! <b><i>Сообщение с кодом автоматически удалится из этого чата.</i></b>",
-            reply_markup=get_cancel_keyboard(),
-            parse_mode="HTML"
         )
         try:
             await callback.bot.send_message( # type: ignore
@@ -458,6 +401,10 @@ async def owner_confirm_report_handler(callback: CallbackQuery, state: FSMContex
             )
         except TelegramForbiddenError:
             logger.info(f"Пользователь {requester_id} заблокировал бота.")
+
+        # ИЗМЕНЕНО: не ставим Form.sms вслепую - отдаём управление циклу
+        # авторизации (get_page_type сам определит форму и запросит данные).
+        await tbank_auth.advance_auth(callback.message, state)
     except Exception as e:
         logger.exception(f"Ошибка при авторизации владельца по запросу отчёта (owner_id={owner_id}): {e}")
         cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)

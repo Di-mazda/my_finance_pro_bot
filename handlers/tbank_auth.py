@@ -10,9 +10,6 @@ from forms.user import Form
 from keyboards import get_main_reply_keyboard, get_cancel_keyboard
 from database import get_limits, get_phone_owner_info, get_user_info, set_user_phone_owner, set_user_session_json, add_user, set_user_phone
 from services import tbank_client
-from handlers.reports import download_and_send_report
-# НОВОЕ (03.09.2026): гасим сторожа (services/browser_watchdog.py) в
-# каждом месте, где браузер закрывается штатно - см. разбор утечки памяти.
 from services.browser_watchdog import cancel_watchdog
 
 from logger_config import logger
@@ -20,131 +17,206 @@ from logger_config import logger
 router = Router()
 
 
-# --- ХЕНДЛЕР ПОЛУЧЕНИЯ КОДА ДЛЯ ВХОДА (СМС) ---
-@router.message(Form.sms, F.text)
-async def process_sms_code(message: Message, state: FSMContext):
-    sms_code = message.text.strip() # type: ignore
-    await message.delete()
-    await message.answer("<i>Сообщение с кодом удалено</i>", parse_mode="HTML")
-    await message.answer("💬 Код принят. Ожидайте...")
+# ============================================================================
+# ЦИКЛ АВТОРИЗАЦИИ (диспетчер) - см. диаграмму "КАК ДОЛЖНО РАБОТАТЬ".
+# ============================================================================
+# Раньше поток входа был линейным и жёстко зашитым: process_sms_code сам
+# знал, что дальше пароль или пин; process_password сам ждал пин. Любой
+# неожиданный шаг банка ломал сценарий и вход начинался с телефона заново.
+#
+# Теперь всё крутится вокруг get_page_type. advance_auth - единая точка,
+# которая:
+#   1) спрашивает get_page_type "какая форма сейчас открыта?";
+#   2) для форм, требующих данных от пользователя (sms/password/pin) -
+#      ставит нужный set_state, просит ввод в чат и ВЫХОДИТ (ждёт ответ);
+#   3) для шагов, которые можно пройти без пользователя (phone - ввести
+#      номер из state; bio - скипнуть) - выполняет действие и снова зовёт
+#      саму себя (это и есть "стрелка назад в get_page_type" на диаграмме);
+#   4) для lk - вызывает _after_login (end_point);
+#   5) для blocked/unknown/ошибок - аккуратно завершает вход с сообщением.
+#
+# Каждый process_* хендлер ниже теперь только вводит свои данные и в конце
+# снова зовёт advance_auth - т.е. управление всегда возвращается к
+# get_page_type, ровно как на схеме.
 
+# Максимум переходов за один "прогон" advance_auth без ожидания ввода от
+# пользователя - страховка от бесконечного цикла, если банк вдруг начнёт
+# отдавать форму, которую мы не умеем закрывать сами.
+_MAX_AUTOSTEPS = 10
+
+
+async def _fail_auth(message: Message, state: FSMContext, text: str):
+    """Единое аккуратное завершение входа при ошибке: сообщение + очистка."""
     data = await state.get_data()
     browser = data.get("browser")
-    context = data.get("context")
+    end_point = data.get("end_point", "")
+    is_authorized = end_point != "registration"
+
+    await message.answer(text, reply_markup=get_main_reply_keyboard(is_authorized))
+    cancel_watchdog(data.get("watchdog_task"))
+    if browser:
+        await browser.close()
+    await state.clear()
+
+
+async def advance_auth(message: Message, state: FSMContext):
+    """
+    Диспетчер шага авторизации. Смотрит get_page_type и либо запрашивает у
+    пользователя данные (и выходит), либо сам проходит шаг и повторяет,
+    либо завершает вход через _after_login.
+    """
+    data = await state.get_data()
     page = data.get("page")
-    watchdog_task = data.get("watchdog_task")
+    phone = data.get("phone")
 
     if not page:
-        end_point = data.get("end_point", "")
-        is_authorized = end_point != "registration"
-        await message.answer("❌ Ошибка: сессия потеряна. Начните заново", reply_markup=get_main_reply_keyboard(is_authorized))
-        # НОВОЕ (03.09.2026): гасим сторожа вместе с закрытием браузера.
-        cancel_watchdog(watchdog_task)
-        if browser:
-            await browser.close()
-        await state.clear()
+        await _fail_auth(message, state, "❌ Ошибка: сессия потеряна. Начните заново.")
         return
 
-    try:
-        # Дальше может появиться либо форма ввода пароля, либо ввода пин-кода
-        next_step = await tbank_client.submit_sms_code(page, sms_code)
-        # Было: await state.update_data(browser=browser, context=context, page=page)
-        await state.update_data(browser=browser, context=context, page=page, watchdog_task=watchdog_task)
+    for _ in range(_MAX_AUTOSTEPS):
+        try:
+            page_type = await tbank_client.get_page_type(page)
+        except Exception as e:
+            logger.exception(f"advance_auth: get_page_type упал (user_id={message.from_user.id}): {e}")  # type: ignore
+            await _fail_auth(message, state, f"❌ Не удалось определить состояние входа. Ошибка: {e}")
+            return
 
-        if next_step == "password":
+        # --- Формы, требующие данных от пользователя: просим ввод и выходим ---
+        if page_type == "sms":
+            await state.set_state(Form.sms)
+            await message.answer(
+                f"💬 Т-Банк отправил код для входа на номер {phone}. Пожалуйста, введите код сюда в чат.\n"
+                "Мы не храним ваши пароли и коды! <b><i>Сообщение с кодом автоматически удалится из этого чата.</i></b>",
+                parse_mode="HTML",
+                reply_markup=get_cancel_keyboard(),
+            )
+            return
+
+        elif page_type == "password":
             await state.set_state(Form.password)
             await message.answer(
                 "Т-Банк запрашивает пароль. Пожалуйста, введите пароль сюда в чат.\n"
                 "Мы не храним ваши пароли и коды! <b><i>Сообщение с паролем автоматически удалится из этого чата.</i></b>",
                 parse_mode="HTML",
-                reply_markup=get_cancel_keyboard()
+                reply_markup=get_cancel_keyboard(),
             )
-        else:  # "pin"
+            return
+
+        elif page_type == "pin":
             await state.set_state(Form.pin)
             await message.answer(
                 "Т-Банк запрашивает пин-код. Пожалуйста, введите пин-код сюда в чат.\n"
                 "Мы не храним ваши пароли и коды! <b><i>Сообщение с пин-кодом автоматически удалится из этого чата.</i></b>",
                 parse_mode="HTML",
-                reply_markup=get_cancel_keyboard()
+                reply_markup=get_cancel_keyboard(),
             )
+            return
 
+        # --- Шаги, которые проходим сами и снова зовём get_page_type ---
+        elif page_type == "phone":
+            # Мы на форме номера, а номер уже известен из state - вводим его
+            # сами и продолжаем цикл (не гоняем пользователя вводить телефон).
+            if not phone:
+                await _fail_auth(message, state, "❌ Ошибка входа: номер телефона не задан.")
+                return
+            try:
+                await tbank_client.start_phone_login(page, phone)
+            except Exception as e:
+                logger.exception(f"advance_auth: ввод телефона упал (user_id={message.from_user.id}): {e}")  # type: ignore
+                await _fail_auth(message, state, f"❌ Ошибка при вводе номера. Ошибка: {e}")
+                return
+            continue
+
+        elif page_type == "bio":
+            try:
+                await tbank_client.skip_bio(page)
+            except Exception as e:
+                logger.exception(f"advance_auth: скип биометрии упал (user_id={message.from_user.id}): {e}")  # type: ignore
+                await _fail_auth(message, state, f"❌ Ошибка на экране биометрии. Ошибка: {e}")
+                return
+            continue
+
+        # --- Конечная точка: успех ---
+        elif page_type == "lk":
+            await _after_login(message, state)
+            return
+
+        # --- Проблемные состояния ---
+        elif page_type == "blocked":
+            logger.warning(f"advance_auth: банк показал 'Доступ заблокирован' (user_id={message.from_user.id})")  # type: ignore
+            await _fail_auth(
+                message, state,
+                "❌ Т-Банк заблокировал автоматический вход (антифрод). "
+                "Попробуйте позже.",
+            )
+            return
+
+        else:  # "unknown"
+            await _fail_auth(
+                message, state,
+                "❌ Не удалось распознать страницу входа. Попробуйте начать заново.",
+            )
+            return
+
+    # Вышли из цикла, ни разу не попросив ввод и не дойдя до ЛК.
+    await _fail_auth(message, state, "❌ Вход зациклился на неизвестном шаге. Попробуйте заново.")
+
+
+# --- ХЕНДЛЕР ПОЛУЧЕНИЯ КОДА ДЛЯ ВХОДА (СМС) ---
+@router.message(Form.sms, F.text)
+async def process_sms_code(message: Message, state: FSMContext):
+    sms_code = message.text.strip()  # type: ignore
+    await message.delete()
+    await message.answer("<i>Сообщение с кодом удалено</i>", parse_mode="HTML")
+    await message.answer("💬 Код принят. Ожидайте...")
+
+    data = await state.get_data()
+    page = data.get("page")
+
+    if not page:
+        await _fail_auth(message, state, "❌ Ошибка: сессия потеряна. Начните заново.")
+        return
+
+    try:
+        await tbank_client.submit_sms_code(page, sms_code)
     except Exception as e:
-        logger.exception(f"Ошибка при вводе смс-кода (user_id={message.from_user.id}): {e}") # type: ignore
-        await message.answer(f"❌ Ошибка при вводе кода или неверный код. Ошибка: {e}")
-        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
-        if browser:
-            await browser.close()
-        await state.clear()
+        logger.exception(f"Ошибка при вводе смс-кода (user_id={message.from_user.id}): {e}")  # type: ignore
+        await _fail_auth(message, state, f"❌ Ошибка при вводе кода или неверный код. Ошибка: {e}")
+        return
+
+    # Управление снова уходит в get_page_type - он решит, что дальше.
+    await advance_auth(message, state)
 
 
 # --- ХЕНДЛЕР ВВОДА ПАРОЛЯ ---
 @router.message(Form.password, F.text)
 async def process_password(message: Message, state: FSMContext):
-    password = message.text.strip() # type: ignore
+    password = message.text.strip()  # type: ignore
     await message.delete()
     await message.answer("<i>Сообщение с паролем удалено</i>", parse_mode="HTML")
     await message.answer("Пароль принят. Ожидайте...")
 
     data = await state.get_data()
-    browser = data.get("browser")
-    context = data.get("context")
     page = data.get("page")
-    watchdog_task = data.get("watchdog_task")
 
     if not page:
-        end_point = data.get("end_point", "")
-        is_authorized = end_point != "registration"
-        await message.answer("❌ Ошибка: сессия потеряна. Начните заново", reply_markup=get_main_reply_keyboard(is_authorized))
-        # ИСПРАВЛЕНО (03.09.2026): раньше здесь браузер НЕ закрывался (в
-        # отличие от аналогичных веток в process_sms_code/process_pin) -
-        # это была настоящая утечка: если состояние "потерялось" именно на
-        # шаге пароля, browser оставался висеть в памяти навсегда. Заодно
-        # гасим сторожа, раз закрываем браузер сами.
-        # Было: await state.clear()
-        cancel_watchdog(watchdog_task)
-        if browser:
-            await browser.close()
-        await state.clear()
+        await _fail_auth(message, state, "❌ Ошибка: сессия потеряна. Начните заново.")
         return
 
     try:
         await tbank_client.submit_password(page, password)
     except Exception as e:
-        logger.exception(f"Ошибка при вводе пароля (user_id={message.from_user.id}): {e}") # type: ignore
-        await message.answer(f"❌ Ошибка при вводе пароля. Ошибка: {e}")
-        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
-        if browser:
-            await browser.close()
-        await state.clear()
+        logger.exception(f"Ошибка при вводе пароля (user_id={message.from_user.id}): {e}")  # type: ignore
+        await _fail_auth(message, state, f"❌ Ошибка при вводе пароля. Ошибка: {e}")
         return
 
-    # Было: await state.update_data(browser=browser, context=context, page=page)
-    await state.update_data(browser=browser, context=context, page=page, watchdog_task=watchdog_task)
-
-    try:
-        await tbank_client.wait_for_pin_form(page)
-    except Exception as e:
-        logger.exception(f"Форма пин-кода не появилась после ввода пароля (user_id={message.from_user.id}): {e}") # type: ignore
-        await message.answer(f"❌ Не дождались формы пин-кода после пароля. Ошибка: {e}")
-        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
-        if browser:
-            await browser.close()
-        await state.clear()
-        return
-
-    await state.set_state(Form.pin)
-    await message.answer(
-        "Т-Банк запрашивает пин-код. Пожалуйста, введите пин-код сюда в чат.\n"
-        "Мы не храним ваши пароли и коды! <b><i>Сообщение с пин-кодом автоматически удалится из этого чата.</i></b>",
-        parse_mode="HTML",
-        reply_markup=get_cancel_keyboard()
-    )
+    await advance_auth(message, state)
 
 
 # --- ВВОД ПИН-КОДА ---
 @router.message(Form.pin, F.text)
 async def process_pin(message: Message, state: FSMContext):
-    pin_code = message.text.strip() # type: ignore
+    pin_code = message.text.strip()  # type: ignore
     await message.delete()
     await message.answer("<i>Сообщение с пин-кодом удалено</i>", parse_mode="HTML")
 
@@ -155,33 +227,20 @@ async def process_pin(message: Message, state: FSMContext):
     await message.answer("Пин-код принят. Ожидайте...")
 
     data = await state.get_data()
-    browser = data.get("browser")
-    context = data.get("context")
     page = data.get("page")
-    watchdog_task = data.get("watchdog_task")
 
     if not page:
-        end_point = data.get("end_point", "")
-        is_authorized = end_point != "registration"
-        await message.answer("❌ Ошибка: сессия потеряна. Начните заново", reply_markup=get_main_reply_keyboard(is_authorized))
-        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
-        if browser:
-            await browser.close()
-        await state.clear()
+        await _fail_auth(message, state, "❌ Ошибка: сессия потеряна. Начните заново.")
         return
 
     try:
         await tbank_client.submit_pin(page, pin_code)
     except Exception as e:
-        logger.exception(f"Ошибка при вводе пин-кода (user_id={message.from_user.id}): {e}") # type: ignore
-        await message.answer(f"❌ Ошибка при вводе пин-кода или неверный пин-код. Ошибка: {e}")
-        cancel_watchdog(watchdog_task)  # НОВОЕ (03.09.2026)
-        if browser:
-            await browser.close()
-        await state.clear()
+        logger.exception(f"Ошибка при вводе пин-кода (user_id={message.from_user.id}): {e}")  # type: ignore
+        await _fail_auth(message, state, f"❌ Ошибка при вводе пин-кода или неверный пин-код. Ошибка: {e}")
         return
 
-    await _after_login(message, state)
+    await advance_auth(message, state)
 
 
 async def _after_login(message: Message, state: FSMContext):
@@ -230,6 +289,9 @@ async def _after_login(message: Message, state: FSMContext):
             # который заведены категории/лимиты (владельца), уже вычислен
             # чуть выше в этой функции.
             # Было: await download_and_send_report(message.bot, report_recipient_id, month, limits, context, page)
+            # ЛЕНИВЫЙ импорт (см. комментарий у импортов вверху файла) -
+            # разрывает цикл reports <-> tbank_auth.
+            from handlers.reports import download_and_send_report
             await download_and_send_report(message.bot, report_recipient_id, month, limits, context, page, phone=phone)
 
             if report_recipient_id != user_id:
@@ -302,8 +364,6 @@ async def _after_login(message: Message, state: FSMContext):
         logger.exception(f"Ошибка в _after_login (user_id={user_id}, end_point={end_point!r}): {e}")
         await message.answer(f"❌ Ошибка при завершении входа. Ошибка: {e}")
     finally:
-        # НОВОЕ (03.09.2026): вход (успешно или нет) завершился - сторож
-        # больше не нужен, гасим его вместе с закрытием браузера.
         cancel_watchdog(data.get("watchdog_task"))
         if browser:
             await browser.close()
