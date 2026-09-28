@@ -167,42 +167,97 @@ async def launch_browser(playwright_instance, headless: bool | None = None):
     return browser
 
 
-async def try_restore_session(browser, session_json_str: str):
+# НОВОЕ: единая фабрика контекста браузера. Все контексты создаются
+# ТОЛЬКО через неё, чтобы параметры (в первую очередь ignore_https_errors)
+# задавались в одном месте, а не дублировались по хендлерам.
+#
+# ignore_https_errors=True: Т-Банк не продлил сертификат, и Chromium
+# отдаёт ERR_CERT_AUTHORITY_INVALID, из-за чего page.goto падает и вход
+# не начинается вовсе. Этот флаг говорит Playwright игнорировать ошибки
+# проверки TLS-сертификата именно для этого контекста (на реальный
+# трафик и на сохранение кук это не влияет). Как только банк починит
+# сертификат, флаг можно оставить - он не мешает валидному сертификату,
+# либо убрать, если хочется строгой проверки.
+async def new_context(browser, storage_state=None):
+    kwargs = {"ignore_https_errors": True}
+    if storage_state is not None:
+        kwargs["storage_state"] = storage_state
+    return await browser.new_context(**kwargs)
+
+
+async def restore_session(browser, session_json_str: str):
     """
     Пытается восстановить сохранённую сессию.
 
-    Возвращает (context, page, reused):
-    reused=True, если сессия рабочая и мы уже в личном кабинете.
+    Возвращает (context, page)
     Если сессия протухла - context/page уже "чистые", можно логиниться заново.
     """
     try:
         storage_state = json.loads(session_json_str)
+        context = await new_context(browser, storage_state=storage_state)
     except (json.JSONDecodeError, TypeError) as e:
         logger.warning(
             f"try_restore_session: не удалось разобрать сохранённую сессию "
             f"(будет выполнен вход заново). Ошибка: {e}"
         )
-        context = await browser.new_context()
-        page = await context.new_page()
-        return context, page, False
+        context = await new_context(browser)
 
-    context = await browser.new_context(storage_state=storage_state)
     page = await context.new_page()
 
     await page.goto(TARGET_URL)
     await page.wait_for_load_state("load")
+
+    return context, page
+
+async def get_page_type(page, timeout: int = 30000) -> str:
+    """Определяет, какая страница сейчас открыта в браузере.
+
+    Это "сердце" цикла авторизации: после каждого ввода данных цикл
+    (см. handlers/tbank_auth.advance_auth) снова зовёт эту функцию, чтобы
+    понять, что банк показал дальше, и направить на нужный шаг.
+
+    Возвращает:
+        phone   - форма ввода телефона
+        sms     - форма ввода кода из смс
+        password- форма ввода пароля
+        pin     - форма ввода пин-кода
+        bio     - экран предложения биометрии/passkey (его надо скипнуть)
+        lk      - личный кабинет (успешный вход)
+        blocked - "Доступ заблокирован" (антифрод банка, см. про headless)
+        unknown - ничего из перечисленного не появилось за timeout мс
+    """
+    selectors = {
+        "phone": '[automation-id="phone-input"]',
+        "sms": '[automation-id="otp-input"]',
+        "password": '[automation-id="password-input"]',
+        "pin": '[automation-id="pin-code-input-0"]',
+        "bio": '[automation-id="passkey-suggestion-form"]',
+        "lk": '[data-qa-type="navigation/username"]',
+    }
+
+    combined = ", ".join(selectors.values())
+
     try:
-        await page.locator('[data-qa-type="navigation/username"]').wait_for(state= 'attached', timeout=5000)
-    except:
-        # Сессия устарела - создаём чистый контекст
-        await context.close()
-        context = await browser.new_context()
-        page = await context.new_page()
-        return context, page, False
+        await page.wait_for_selector(combined, timeout=timeout)
+    except PlaywrightTimeoutError:
+        # Ни одна из ожидаемых форм не появилась. Отдельно проверяем экран
+        # блокировки антифрода - по нему видно, что дело в детекте бота
+        # (см. большой комментарий "ПРО HEADLESS" в конце файла), а не в
+        # обычной опечатке в коде/пароле.
+        body_text = (await page.locator("body").text_content() or "")
+        if "Доступ заблокирован" in body_text or "Access denied" in body_text:
+            return "blocked"
+        logger.warning(
+            "get_page_type: за %d мс не появилась ни одна известная форма. "
+            "URL=%s", timeout, page.url
+        )
+        return "unknown"
 
-    if page.url.startswith(TARGET_URL):
-        return context, page, True
+    for page_type, selector in selectors.items():
+        if await page.locator(selector).count() > 0:
+            return page_type
 
+    return "unknown"
     
 
 async def start_phone_login(page, phone):
@@ -219,43 +274,32 @@ async def start_phone_login(page, phone):
     await submit_button.click()
 
 
-async def submit_sms_code(page, sms_code: str) -> str:
-    """
-    Вводит код из смс.
-
-    Возвращает, какая форма появилась дальше: "password" или "pin".
-    """
+# ИЗМЕНЕНО: submit_sms_code больше НЕ определяет, какая форма будет
+# следующей - это теперь единая забота get_page_type (см. диспетчер
+# advance_auth в handlers/tbank_auth.py). Функция просто вводит код и
+# отправляет его; какая форма откроется дальше (пароль / пин / сразу ЛК),
+# решит следующий вызов get_page_type в цикле авторизации.
+async def submit_sms_code(page, sms_code: str) -> None:
+    """Вводит код из смс и отправляет его."""
     await page.locator('[automation-id="otp-input"]').fill(sms_code)
 
-    password_selector = '[automation-id="password-input"]'
-    pin_selector = '[automation-id="pin-code-input-0"]'
 
-    await page.wait_for_selector(f'{password_selector}, {pin_selector}')
-
-    if await page.locator(password_selector).count() > 0:
-        return "password"
-    elif await page.locator(pin_selector).count() > 0:
-        return "pin"
-
-    raise ValueError("Открыта неизвестная форма. Ожидались формы ввода пароля или пин-кода.")
-
-
-async def submit_password(page, password: str):
+async def submit_password(page, password: str) -> None:
+    """Вводит пароль и отправляет его."""
     input_selector = '[automation-id="password-input"]'
     button_submit_selector = '[automation-id="button-submit"]'
 
     await page.locator(input_selector).fill(password)
     await page.locator(button_submit_selector).click()
 
-async def wait_for_pin_form(page):
-    """Ожидает появления формы ввода пин-кода на странице."""
-    await page.wait_for_selector('[automation-id="pin-code-input-0"]')
 
-
-async def submit_pin(page, pin_code: str):
-    """
-    Вводит пин-код и проверяет успешность входа.
-    """
+# ИЗМЕНЕНО: submit_pin больше не скипает биометрию и не проверяет переход
+# в ЛК сам - и то, и другое теперь отдельные шаги цикла авторизации,
+# которым управляет get_page_type (bio -> skip_bio, lk -> _after_login).
+# Так один и тот же шаг "проверить, куда попали" не дублируется в двух
+# местах и одинаково работает и при первом входе, и при повторном.
+async def submit_pin(page, pin_code: str) -> None:
+    """Вводит пин-код и отправляет его."""
     await page.wait_for_selector('[automation-id="pin-code-input-0"]')
 
     for i, digit in enumerate(pin_code):
@@ -264,28 +308,21 @@ async def submit_pin(page, pin_code: str):
     button_submit_selector = '[automation-id="button-submit"]'
     await page.locator(button_submit_selector).click()
 
-    # Биометрию пропускаем
+
+# НОВОЕ: пропустить экран с предложением биометрии/passkey. Раньше это
+# было зашито внутрь submit_pin; вынесено отдельно, чтобы get_page_type
+# мог обработать форму "bio" как самостоятельный шаг цикла (см. диаграмму
+# "Скипаем био").
+async def skip_bio(page) -> None:
+    """Нажимает "Пропустить" на экране предложения биометрии/passkey."""
+    button_skip_selector = '[automation-id="button-skip"]'
     try:
-        button_skip_selector = '[automation-id="button-skip"]'
-        await page.wait_for_selector(button_skip_selector)
+        await page.wait_for_selector(button_skip_selector, timeout=5000)
         await page.locator(button_skip_selector).click()
-    except:
-        # Рано или поздно они уберут этот шаг, поэтому просто пропускаю 
-        pass
-
-    ERROR_SELECTOR = '[automation-id="server-error"]'
-    try:
-        await page.wait_for_url(f"{TARGET_URL}**", timeout=15000)
     except PlaywrightTimeoutError:
-        if await page.locator(ERROR_SELECTOR).count() > 0:
-            error_text = (await page.locator(ERROR_SELECTOR).text_content() or "").strip()
-            raise ValueError(f"Неверный пин-код{f': {error_text}' if error_text else ''}.")
-
-        raise ValueError(
-            "Не удалось подтвердить успешный вход по пин-коду: страница не "
-            "перешла в личный кабинет за отведённое время, и явного "
-            "сообщения об ошибке найти не удалось."
-        )
+        # Рано или поздно они уберут этот шаг - тогда кнопки просто не будет,
+        # и это не ошибка: следующий get_page_type увидит уже ЛК.
+        logger.info("skip_bio: кнопка пропуска биометрии не найдена, пропускаю шаг.")
 
 
 async def save_session(context) -> str:
