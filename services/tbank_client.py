@@ -174,10 +174,9 @@ async def launch_browser(playwright_instance, headless: bool | None = None):
 # ignore_https_errors=True: Т-Банк не продлил сертификат, и Chromium
 # отдаёт ERR_CERT_AUTHORITY_INVALID, из-за чего page.goto падает и вход
 # не начинается вовсе. Этот флаг говорит Playwright игнорировать ошибки
-# проверки TLS-сертификата именно для этого контекста (на реальный
-# трафик и на сохранение кук это не влияет). Как только банк починит
-# сертификат, флаг можно оставить - он не мешает валидному сертификату,
-# либо убрать, если хочется строгой проверки.
+# проверки TLS-сертификата именно для этого контекста. Как только банк
+# починит сертификат, флаг можно оставить - он не мешает валидному
+# сертификату, либо убрать, если хочется строгой проверки.
 async def new_context(browser, storage_state=None):
     kwargs = {"ignore_https_errors": True}
     if storage_state is not None:
@@ -209,41 +208,61 @@ async def restore_session(browser, session_json_str: str):
 
     return context, page
 
-async def get_page_type(page, timeout: int = 30000) -> str:
+# Селекторы форм вынесены на уровень модуля - их использует и get_page_type,
+# и диспетчер, чтобы знать, какую форму "ждать, пока исчезнет".
+PAGE_SELECTORS = {
+    "phone": '[automation-id="phone-input"]',
+    "sms": '[automation-id="otp-input"]',
+    "password": '[automation-id="password-input"]',
+    "pin": '[automation-id="pin-code-input-0"]',
+    "bio": '[automation-id="passkey-suggestion-form"]',
+    "lk": '[data-qa-type="navigation/username"]',
+}
+
+
+async def get_page_type(page, timeout: int = 30000, gone_type: str | None = None) -> str:
     """Определяет, какая страница сейчас открыта в браузере.
 
     Это "сердце" цикла авторизации: после каждого ввода данных цикл
     (см. handlers/tbank_auth.advance_auth) снова зовёт эту функцию, чтобы
     понять, что банк показал дальше, и направить на нужный шаг.
 
+    gone_type - тип формы, которую мы только что отправили (например "pin").
+    Т-Банк меняет форму не мгновенно: сразу после ввода старая форма ещё
+    висит в DOM, и без этой проверки get_page_type тут же снова увидел бы
+    её и зациклил шаг ("ввёл пин -> опять просит пин"). Поэтому сначала
+    ДОЖИДАЕМСЯ, пока форма gone_type пропадёт со страницы, и только потом
+    смотрим, что появилось. Если она и так уже пропала - ждать нечего.
+
     Возвращает:
-        phone   - форма ввода телефона
-        sms     - форма ввода кода из смс
-        password- форма ввода пароля
-        pin     - форма ввода пин-кода
-        bio     - экран предложения биометрии/passkey (его надо скипнуть)
-        lk      - личный кабинет (успешный вход)
-        blocked - "Доступ заблокирован" (антифрод банка, см. про headless)
-        unknown - ничего из перечисленного не появилось за timeout мс
+        phone / sms / password / pin / bio / lk - как выше;
+        blocked - "Доступ заблокирован" (антифрод банка);
+        unknown - ничего из перечисленного не появилось за timeout мс.
     """
-    selectors = {
-        "phone": '[automation-id="phone-input"]',
-        "sms": '[automation-id="otp-input"]',
-        "password": '[automation-id="password-input"]',
-        "pin": '[automation-id="pin-code-input-0"]',
-        "bio": '[automation-id="passkey-suggestion-form"]',
-        "lk": '[data-qa-type="navigation/username"]',
-    }
+    # 1) Ждём, пока предыдущая форма исчезнет (гонка "форма ещё не сменилась").
+    if gone_type and gone_type in PAGE_SELECTORS:
+        try:
+            await page.wait_for_selector(
+                PAGE_SELECTORS[gone_type], state="detached", timeout=timeout
+            )
+        except PlaywrightTimeoutError:
+            # Форма не исчезла - возможно, банк показал ошибку прямо в ней
+            # (неверный пин/пароль) и оставил ту же форму. Отдаём её тип
+            # обратно, диспетчер попросит ввод заново.
+            body_text = (await page.locator("body").text_content() or "")
+            if "Доступ заблокирован" in body_text or "Access denied" in body_text:
+                return "blocked"
+            logger.warning(
+                "get_page_type: форма %r не исчезла за %d мс (возможно, "
+                "ошибка ввода). URL=%s", gone_type, timeout, page.url
+            )
+            return gone_type
 
-    combined = ", ".join(selectors.values())
-
+    # 2) Ждём появления любой из известных форм.
+    combined = ", ".join(PAGE_SELECTORS.values())
     try:
         await page.wait_for_selector(combined, timeout=timeout)
     except PlaywrightTimeoutError:
-        # Ни одна из ожидаемых форм не появилась. Отдельно проверяем экран
-        # блокировки антифрода - по нему видно, что дело в детекте бота
-        # (см. большой комментарий "ПРО HEADLESS" в конце файла), а не в
-        # обычной опечатке в коде/пароле.
         body_text = (await page.locator("body").text_content() or "")
         if "Доступ заблокирован" in body_text or "Access denied" in body_text:
             return "blocked"
@@ -253,7 +272,7 @@ async def get_page_type(page, timeout: int = 30000) -> str:
         )
         return "unknown"
 
-    for page_type, selector in selectors.items():
+    for page_type, selector in PAGE_SELECTORS.items():
         if await page.locator(selector).count() > 0:
             return page_type
 
@@ -276,9 +295,7 @@ async def start_phone_login(page, phone):
 
 # ИЗМЕНЕНО: submit_sms_code больше НЕ определяет, какая форма будет
 # следующей - это теперь единая забота get_page_type (см. диспетчер
-# advance_auth в handlers/tbank_auth.py). Функция просто вводит код и
-# отправляет его; какая форма откроется дальше (пароль / пин / сразу ЛК),
-# решит следующий вызов get_page_type в цикле авторизации.
+# advance_auth в handlers/tbank_auth.py).
 async def submit_sms_code(page, sms_code: str) -> None:
     """Вводит код из смс и отправляет его."""
     await page.locator('[automation-id="otp-input"]').fill(sms_code)
@@ -293,13 +310,12 @@ async def submit_password(page, password: str) -> None:
     await page.locator(button_submit_selector).click()
 
 
-# ИЗМЕНЕНО: submit_pin больше не скипает биометрию и не проверяет переход
-# в ЛК сам - и то, и другое теперь отдельные шаги цикла авторизации,
-# которым управляет get_page_type (bio -> skip_bio, lk -> _after_login).
-# Так один и тот же шаг "проверить, куда попали" не дублируется в двух
-# местах и одинаково работает и при первом входе, и при повторном.
+# ИЗМЕНЕНО: submit_pin больше не кликает кнопку подтверждения (форма пин-
+# кода отправляется сама после ввода последней цифры) и не скипает био /
+# не проверяет ЛК сам - этим управляет цикл через get_page_type
+# (bio -> skip_bio, lk -> _after_login).
 async def submit_pin(page, pin_code: str) -> None:
-    """Вводит пин-код и отправляет его."""
+    """Вводит пин-код (форма отправляется автоматически после последней цифры)."""
     await page.wait_for_selector('[automation-id="pin-code-input-0"]')
 
     for i, digit in enumerate(pin_code):
