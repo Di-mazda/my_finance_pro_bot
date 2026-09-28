@@ -305,9 +305,6 @@ async def submit_pin(page, pin_code: str) -> None:
     for i, digit in enumerate(pin_code):
         await page.fill(f'[id="pinCode{i}"]', digit)
 
-    button_submit_selector = '[automation-id="button-submit"]'
-    await page.locator(button_submit_selector).click()
-
 
 # НОВОЕ: пропустить экран с предложением биометрии/passkey. Раньше это
 # было зашито внутрь submit_pin; вынесено отдельно, чтобы get_page_type
